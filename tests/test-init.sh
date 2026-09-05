@@ -46,6 +46,15 @@ assert_eq "skill in language subdir" \
     true \
     "$([ -f "$SANDBOX/.claude/skills/discover/typescript/SKILL.md" ] && echo true || echo false)"
 
+# Router skill makes `discover/<lang>` routable
+assert_eq "router skill exists" \
+    true \
+    "$([ -f "$SANDBOX/.claude/skills/discover/SKILL.md" ] && echo true || echo false)"
+
+assert_contains "router references discover/<lang>" \
+    'discover/<lang>' \
+    "$(cat "$SANDBOX/.claude/skills/discover/SKILL.md")"
+
 # ─────────────────────────────────────────────────────────
 echo "=== init: second language coexists without --force ==="
 
@@ -249,5 +258,40 @@ assert_not_contains "wrapper has no LANG_ID assignment" \
 assert_contains "wrapper is the dispatch script" \
     "multi-language" \
     "$wrapper_content"
+
+# ─────────────────────────────────────────────────────────
+echo "=== swift: skill uses module-graph descriptions ==="
+
+# Set up a minimal Xcode-style Swift project
+setup_sandbox
+rm -f "$SANDBOX/package.json" "$SANDBOX/src/index.ts" "$SANDBOX/src/Main.kt"
+mkdir -p "$SANDBOX/MyApp.xcodeproj"
+# Minimal .pbxproj with a PBXNativeTarget (application)
+cat > "$SANDBOX/MyApp.xcodeproj/project.pbxproj" <<'PBXPROJ'
+{
+    objects = {
+        AABBCCDD = {isa = PBXNativeTarget; name = "MyApp"; productType = "com.apple.product-type.application"; };
+    };
+}
+PBXPROJ
+mkdir -p "$SANDBOX/MyApp"
+echo '@main struct MyAppApp: App { var body: some Scene { WindowGroup {} } }' > "$SANDBOX/MyApp/MyApp.swift"
+
+(cd "$SANDBOX" && bash "$DISCOVER_BIN" init swift --force 2>&1) >/dev/null
+
+swift_skill="$(cat "$SANDBOX/.claude/skills/discover/swift/SKILL.md")"
+
+# Verify Swift-specific descriptions replace generic import-graph descriptions
+assert_contains "swift skill warns about module membership" \
+    "module membership" \
+    "$swift_skill"
+
+assert_contains "swift skill describes call-chain tracing" \
+    "call chain" \
+    "$swift_skill"
+
+assert_not_contains "swift skill does not claim BFS from entry point" \
+    "BFS from the entry point" \
+    "$swift_skill"
 
 report

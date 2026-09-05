@@ -483,17 +483,22 @@ fi
 # ─────────────────────────────────────────────────────────
 # Subcommand: usages
 # ─────────────────────────────────────────────────────────
+# --json suppresses the human-readable count trailer on stderr, so that a
+# consumer capturing stdout and stderr as one stream (agent harnesses, CI logs)
+# still receives parseable JSON. Without it the trailer is emitted on stderr as
+# before, which is what a human at a terminal wants.
 cmd_usages() {
-    local pattern="" live_only=false
+    local pattern="" live_only=false json_mode=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --live-only) live_only=true ;;
+            --json)      json_mode=true ;;
             *) pattern="$1" ;;
         esac
         shift
     done
 
-    [ -n "$pattern" ] || die "usage: discover.sh usages <pattern> [--live-only]"
+    [ -n "$pattern" ] || die "usage: discover.sh usages <pattern> [--live-only] [--json]"
 
     local live_set=""
     if $live_only; then
@@ -510,7 +515,7 @@ cmd_usages() {
         fi
     done
 
-    [ "$raw" != "[]" ] || { echo "[]"; echo "0 usages found" >&2; return; }
+    [ "$raw" != "[]" ] || { echo "[]"; $json_mode || echo "0 usages found" >&2; return; }
 
     local formatted
     if $live_only && [ -n "$live_set" ]; then
@@ -530,9 +535,11 @@ cmd_usages() {
     fi
 
     echo "$formatted"
-    local count
-    count="$(echo "$formatted" | jq 'length')"
-    echo "$count usages found" >&2
+    if ! $json_mode; then
+        local count
+        count="$(echo "$formatted" | jq 'length')"
+        echo "$count usages found" >&2
+    fi
 }
 
 # ─────────────────────────────────────────────────────────
@@ -572,6 +579,13 @@ discover_main() {
                 die "module-of: not supported for $LANG_ID (no module graph)"
             fi
             ;;
+        trace)
+            if declare -f cmd_trace >/dev/null 2>&1; then
+                cmd_trace "$@"
+            else
+                die "trace: not supported for $LANG_ID"
+            fi
+            ;;
         *)
             echo "usage: discover.sh <command> [args]" >&2
             echo "" >&2
@@ -583,7 +597,11 @@ discover_main() {
             echo "  live-files [--rebuild-cache]              List all files reachable from entry point" >&2
             echo "  is-live <file>                           Check if a file is reachable" >&2
             echo "  importers <file>                         Find all files that import <file>" >&2
-            echo "  usages <pattern> [--live-only]           Structural search for a pattern" >&2
+            echo "  usages <pattern> [--live-only] [--json]  Structural search for a pattern" >&2
+            echo "                                           (--json: omit the stderr count trailer)" >&2
+            if declare -f cmd_trace >/dev/null 2>&1; then
+                echo "  trace <symbol> [--max-depth N] [--json]  Trace call chain upward from callsites" >&2
+            fi
             if declare -f cmd_modules >/dev/null 2>&1; then
                 echo "  modules [--json]                         List modules and dependencies" >&2
                 echo "  module-of <file>                         Show which module owns a file" >&2

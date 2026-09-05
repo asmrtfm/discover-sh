@@ -61,7 +61,7 @@ Exits 1 with `"error": "not found in import graph"` for external packages or sym
 
 ### live-files
 
-BFS from the entry point following all {{IMPORT_VERB}}s. Outputs every reachable file, one per line.
+{{LIVE_FILES_DESC}}
 
 ```bash
 bash {{SCRIPT_PATH}} live-files
@@ -69,7 +69,7 @@ bash {{SCRIPT_PATH}} live-files
 
 ### is-live
 
-Check whether a single file is reachable from the entry point.
+{{IS_LIVE_DESC}}
 
 ```bash
 bash {{SCRIPT_PATH}} is-live {{EXAMPLE_FILE}}
@@ -86,7 +86,7 @@ bash {{SCRIPT_PATH}} importers {{EXAMPLE_FILE}}
 
 ### usages
 
-Find all references to an ast-grep pattern. `--live-only` filters to files reachable from the entry point.
+Find all references to an ast-grep pattern. {{USAGES_LIVE_DESC}}
 
 ```bash
 bash {{SCRIPT_PATH}} usages '{{USAGE_EXAMPLE_1}}' --live-only
@@ -94,6 +94,8 @@ bash {{SCRIPT_PATH}} usages '{{USAGE_EXAMPLE_2}}'
 ```
 
 The pattern is any valid ast-grep {{LANG_NAME}} pattern — metavariables (`$NAME`, `$$$ARGS`) match structurally.
+
+{{EXTRA_SUBCOMMANDS}}
 
 ## Tests
 
@@ -113,8 +115,4 @@ Use this before relying on training data for {{LANG_NAME}} API details, configur
 
 ## Rules
 
-- Use `discover.sh` before claiming any symbol, file, or code path is live or dead.
-- Use `definition` before assuming which file a class comes from — duplicate names exist.
-- Use `is-live` or `live-files` before recommending changes to a file — it may be dead code.
-- Use `usages --live-only` instead of grep when finding who calls something.
-- Never treat a grep match as reachability evidence.
+{{RULES}}

@@ -1,0 +1,41 @@
+---
+name: discover
+description: Structural codebase navigation via ast-grep. Routes to language-specific subskills. Use `discover/<lang>` for language-specific commands.
+argument-hint: <lang> | langs
+---
+
+## Installed languages
+
+Check which language scripts are installed:
+
+```bash
+{{WRAPPER_PATH}} langs
+```
+
+## Dispatch
+
+Use the language subskill directly:
+
+- `discover/<lang>` — e.g. `discover/swift`, `discover/typescript`, `discover/ruby`
+
+Or use the wrapper script (auto-detects language from file extension):
+
+```bash
+{{WRAPPER_PATH}} inspect <file>
+{{WRAPPER_PATH}} usages '<pattern>'
+{{WRAPPER_PATH}} definition <file> <symbol>
+```
+
+## Available subcommands (all languages)
+
+| Command | Purpose |
+|---------|---------|
+| `resolve <import>` | Resolve an import to a repo-relative path |
+| `inspect <file>` | Extract structured JSON (imports, entities) |
+| `definition <file> <symbol>` | Find where a symbol is defined |
+| `live-files` | List files reachable from entry point |
+| `is-live <file>` | Check if a file is reachable |
+| `importers <file>` | Find all files that import a file |
+| `usages <pattern>` | Structural search for an ast-grep pattern |
+
+See the language-specific subskill for examples, caveats, and full usage.

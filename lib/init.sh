@@ -245,7 +245,7 @@ detect_swift() {
     local root="$1"
     local package_swift="$root/Package.swift"
     if [ -f "$package_swift" ]; then
-        # Look for an executable target with a main.swift
+        # SPM: look for an executable target with a main.swift or App.swift
         local target
         for dir in "$root"/Sources/*/; do
             [ -d "$dir" ] || continue
@@ -257,6 +257,57 @@ detect_swift() {
                 break
             fi
         done
+        return
+    fi
+
+    # Xcode project: find the app target's source directory from .pbxproj
+    local pbxproj
+    pbxproj="$(compgen -G "$root"/*.xcodeproj/project.pbxproj 2>/dev/null | head -1)"
+    if [ -n "$pbxproj" ] && [ -f "$pbxproj" ]; then
+        # Extract the first PBXNativeTarget with productType = application
+        local app_name=""
+        local in_target=false current_name="" current_type=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ isa\ =\ PBXNativeTarget ]]; then
+                in_target=true
+            fi
+            if $in_target; then
+                if [[ "$line" =~ name\ =\ \"?([^\";\}]+)\"? ]]; then
+                    current_name="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$line" =~ productType\ =\ \"([^\"]+)\" ]]; then
+                    current_type="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$line" == *"};"* ]] && [ -n "$current_name" ]; then
+                    if [[ "$current_type" == *application* ]]; then
+                        app_name="$current_name"
+                        break
+                    fi
+                    current_name=""
+                    current_type=""
+                    in_target=false
+                fi
+            fi
+        done < "$pbxproj"
+
+        if [ -n "$app_name" ]; then
+            DETECTED_PACKAGE="$app_name"
+            # Find the source directory matching the app target name
+            for candidate in "$app_name" "${app_name// /}" "${app_name}Sources"; do
+                if [ -d "$root/$candidate" ]; then
+                    SRC_DIR_REL="$candidate"
+                    break
+                fi
+            done
+            # Look for SwiftUI App.swift or @main entry point
+            if [ -n "$SRC_DIR_REL" ] && [ -d "$root/$SRC_DIR_REL" ]; then
+                local app_swift
+                app_swift="$(grep -rl '@main\|@UIApplicationMain' "$root/$SRC_DIR_REL" --include="*.swift" 2>/dev/null | head -1)"
+                if [ -n "$app_swift" ]; then
+                    DETECTED_ENTRY="$(realpath --relative-to="$root" "$app_swift" 2>/dev/null)"
+                fi
+            fi
+        fi
     fi
 }
 
@@ -307,6 +358,23 @@ render_skill_md() {
     local ctx7_commands
     ctx7_commands="$(build_ctx7_commands)"
 
+    # Defaults for language-specific sections (import-graph languages).
+    # Lang configs can override SKILL_LIVE_FILES_DESC, SKILL_IS_LIVE_DESC,
+    # SKILL_USAGES_LIVE_DESC, SKILL_EXTRA_SUBCOMMANDS, and SKILL_RULES to
+    # match their compilation model.
+    local live_desc="${SKILL_LIVE_FILES_DESC:-BFS from the entry point following all ${SKILL_IMPORT_VERB}s. Outputs every reachable file, one per line.}"
+    local is_live_desc="${SKILL_IS_LIVE_DESC:-Check whether a single file is reachable from the entry point.}"
+    local usages_live_desc="${SKILL_USAGES_LIVE_DESC:-\`--live-only\` filters to files reachable from the entry point.}"
+    local extra_subcmds="${SKILL_EXTRA_SUBCOMMANDS:-}"
+    local rules="${SKILL_RULES:-}"
+    if [ -z "$rules" ]; then
+        rules="- Use \`discover.sh\` before claiming any symbol, file, or code path is live or dead.
+- Use \`definition\` before assuming which file a class comes from — duplicate names exist.
+- Use \`is-live\` or \`live-files\` before recommending changes to a file — it may be dead code.
+- Use \`usages --live-only\` instead of grep when finding who calls something.
+- Never treat a grep match as reachability evidence."
+    fi
+
     # Simple substitutions via sed
     local result
     result="$(sed \
@@ -329,15 +397,25 @@ render_skill_md() {
         -e "s|{{USAGE_EXAMPLE_2}}|${SKILL_USAGE_EXAMPLE_2}|g" \
         "$template")"
 
-    # Multi-line substitution for CTX7_COMMANDS (sed can't do this cleanly)
-    local ctx7_escaped
-    ctx7_escaped="$(printf '%s' "$ctx7_commands" | sed 's/[&/\]/\\&/g')"
-    echo "$result" | awk -v replacement="$ctx7_commands" '{
-        if (index($0, "{{CTX7_COMMANDS}}")) {
-            sub(/{{CTX7_COMMANDS}}/, replacement)
-        }
+    # Multi-line substitutions (sed can't handle newlines in replacement text)
+    # Final sed pass catches {{SCRIPT_PATH}} refs introduced by awk variables
+    # (e.g. SKILL_EXTRA_SUBCOMMANDS may reference {{SCRIPT_PATH}} in code blocks)
+    echo "$result" | awk \
+        -v ctx7="$ctx7_commands" \
+        -v live="$live_desc" \
+        -v is_live="$is_live_desc" \
+        -v usages_live="$usages_live_desc" \
+        -v extra="$extra_subcmds" \
+        -v rules_block="$rules" \
+    '{
+        if (index($0, "{{CTX7_COMMANDS}}"))       { sub(/{{CTX7_COMMANDS}}/,       ctx7) }
+        if (index($0, "{{LIVE_FILES_DESC}}"))     { sub(/{{LIVE_FILES_DESC}}/,     live) }
+        if (index($0, "{{IS_LIVE_DESC}}"))        { sub(/{{IS_LIVE_DESC}}/,        is_live) }
+        if (index($0, "{{USAGES_LIVE_DESC}}"))    { sub(/{{USAGES_LIVE_DESC}}/,    usages_live) }
+        if (index($0, "{{EXTRA_SUBCOMMANDS}}"))   { sub(/{{EXTRA_SUBCOMMANDS}}/,   extra) }
+        if (index($0, "{{RULES}}"))               { sub(/{{RULES}}/,              rules_block) }
         print
-    }'
+    }' | sed "s|{{SCRIPT_PATH}}|${script_path}|g"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -580,11 +658,19 @@ init_main() {
         chmod +x "$script_dir/discover.sh"
     fi
 
-    # Render SKILL.md into .claude/skills/discover/<lang>/
+    # Install parent router skill at .claude/skills/discover/SKILL.md
+    # (this is what makes `Skill(discover/<lang>)` routable)
+    local router_template="$DISCOVER_ROOT/templates/discover-router-SKILL.md.template"
+    local router_target="$claude_dir/skills/discover/SKILL.md"
+    local wrapper_path="$script_rel/discover.sh"
+    if [ -f "$router_template" ]; then
+        sed "s|{{WRAPPER_PATH}}|${wrapper_path}|g" "$router_template" > "$router_target"
+    fi
+
+    # Render language SKILL.md into .claude/skills/discover/<lang>/
     local template="$DISCOVER_ROOT/templates/SKILL.md.template"
     [ -f "$template" ] || die "SKILL.md.template not found at $DISCOVER_ROOT"
 
-    local wrapper_path="$script_rel/discover.sh"
     render_skill_md "$template" "$script_path" "$test_script_path" "$wrapper_path" > "$skill_dir/SKILL.md"
 
     # Copy language-specific usage guide if available
@@ -642,6 +728,7 @@ init_main() {
     echo "  script → $script_dir/discover-${lang}.sh" >&2
     echo "  wrapper→ $script_dir/discover.sh" >&2
     echo "  tests  → $script_dir/test-discover-${lang}.sh" >&2
+    echo "  router → $router_target" >&2
     echo "  skill  → $skill_dir/SKILL.md" >&2
     [ -f "$skill_dir/USAGE.md" ] && echo "  usage  → $skill_dir/USAGE.md" >&2
 }
