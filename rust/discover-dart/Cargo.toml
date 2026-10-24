@@ -1,0 +1,24 @@
+[package]
+name = "discover-dart"
+description = "Deterministic Dart codebase navigation (import graph, liveness, usages) built on ast-grep"
+publish = false
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "discover-dart"
+path = "src/main.rs"
+
+[dependencies]
+# Parsing and pattern matching run in-process against the fork's Dart support.
+ast-grep-core = { workspace = true, features = ["tree-sitter"] }
+ast-grep-language.workspace = true
+# Caches, liveness, the importers index, trace and the shared CLI.
+discover-core = { path = "../discover-core" }
+ignore.workspace = true
+serde.workspace = true
+serde_json = "1.0.116"

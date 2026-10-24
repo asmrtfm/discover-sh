@@ -1,0 +1,23 @@
+[package]
+name = "discover-typescript"
+description = "Deterministic TypeScript codebase navigation (import graph, liveness, usages) built on ast-grep"
+publish = false
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "discover-typescript"
+path = "src/main.rs"
+
+[dependencies]
+# Parsing and pattern matching run in-process with ast-grep's TypeScript/TSX support.
+ast-grep-core = { workspace = true, features = ["tree-sitter"] }
+ast-grep-language.workspace = true
+# Caches, liveness, the importers index, trace and the shared CLI.
+discover-core = { path = "../discover-core" }
+serde.workspace = true
+serde_json = "1.0.116"
