@@ -151,7 +151,7 @@ pub fn asset_usages(graph: &Graph, asset: &str) -> Result<AssetRefs, String> {
           .get(rel)
           .into_iter()
           .flatten()
-          .filter(|row| row.entities_used.iter().any(|e| e == name))
+          .filter(|row| row.entities_used.iter().any(|e| e.name == *name))
           .filter(|row| live_set.contains(row.file.as_str()))
           .map(|row| row.file.clone()),
       );

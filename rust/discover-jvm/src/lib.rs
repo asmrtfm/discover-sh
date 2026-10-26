@@ -14,11 +14,14 @@ use ast_grep_core::AstGrep;
 use ast_grep_core::tree_sitter::{LanguageExt, StrDoc};
 use ast_grep_language::SupportLang;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use cli::main;
 
 pub type Root = AstGrep<StrDoc<SupportLang>>;
+
+/// Identifier text → the 1-based lines where it appears.
+pub type Idents = BTreeMap<String, BTreeSet<usize>>;
 
 /// What a JVM language contributes: its names and how to read its parse tree.
 pub trait Jvm: Send + Sync + 'static {
@@ -93,6 +96,6 @@ pub struct Facts {
   /// Sorted by line.
   pub decls: Vec<Decl>,
   pub main: bool,
-  /// Distinct identifier texts outside the package and import declarations.
-  pub idents: BTreeSet<String>,
+  /// Distinct identifier texts outside the package and import declarations, each with the 1-based lines where it appears.
+  pub idents: Idents,
 }

@@ -8,19 +8,21 @@
 //! when it imports one of its declarations, or uses one by name through its
 //! own package or a wildcard (`.*`) import.
 
-use crate::{Decl, Facts, Import};
+use crate::{Decl, Facts, Idents, Import};
+use discover_core::graph::EntityUse;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Per source file: its package, imports, top-level declarations, whether it
-/// holds a `main`, and the project names it references.
+/// holds a `main`, and the project names it references with the lines where
+/// it references them.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FileIndex {
   pub pkg: String,
   pub imports: Vec<Import>,
   pub decls: Vec<Decl>,
   pub main: bool,
-  pub idents: BTreeSet<String>,
+  pub idents: Idents,
 }
 
 impl From<Facts> for FileIndex {
@@ -58,8 +60,8 @@ pub struct Edge {
   /// import | package | import,package — how the target became visible.
   pub directive: String,
   pub uri: String,
-  /// The target's declarations the file actually references.
-  pub entities_used: Vec<String>,
+  /// The target's declarations the file actually references, with the lines where it does.
+  pub entities_used: Vec<EntityUse>,
 }
 
 pub struct Tables<'a> {
@@ -220,12 +222,12 @@ impl<'a> Tables<'a> {
   pub fn edges(&self) -> Vec<Edge> {
     let mut raw: Vec<Edge> = Vec::new();
     for (file, me) in self.index {
-      let used = |t: &str| -> Vec<String> {
+      // The target's public names this file references, with their lines.
+      let used = |t: &str| -> Idents {
         self
           .public_names(t)
           .into_iter()
-          .filter(|n| me.idents.contains(*n))
-          .map(str::to_string)
+          .filter_map(|n| me.idents.get(n).map(|lines| (n.to_string(), lines.clone())))
           .collect()
       };
 
@@ -237,15 +239,16 @@ impl<'a> Tables<'a> {
             continue;
           }
           let mut entities = used(&hit.file);
-          if me.idents.contains(local) {
-            entities.extend(hit.name.clone());
+          // The imported name is used wherever its local name (alias or member) is.
+          if let (Some(lines), Some(name)) = (me.idents.get(local), hit.name.clone()) {
+            entities.entry(name).or_default().extend(lines);
           }
           raw.push(Edge {
             file: file.clone(),
             target: hit.file,
             directive: "import".into(),
             uri: imp.spec.clone(),
-            entities_used: entities,
+            entities_used: EntityUse::from_map(entities),
           });
         }
       }
@@ -269,7 +272,7 @@ impl<'a> Tables<'a> {
               target: target.clone(),
               directive: "import".into(),
               uri: imp.spec.clone(),
-              entities_used: hit,
+              entities_used: EntityUse::from_map(hit),
             });
           }
         }
@@ -287,20 +290,22 @@ impl<'a> Tables<'a> {
             target: target.clone(),
             directive: "package".into(),
             uri: me.pkg.clone(),
-            entities_used: hit,
+            entities_used: EntityUse::from_map(hit),
           });
         }
       }
     }
 
-    // One edge per (file, target), merging how it was reached.
-    let mut merged: BTreeMap<(String, String), (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>)> =
-      BTreeMap::new();
+    // One edge per (file, target), merging how it was reached and the
+    // lines of each entity used.
+    let mut merged: BTreeMap<(String, String), (BTreeSet<String>, BTreeSet<String>, Idents)> = BTreeMap::new();
     for e in raw {
       let slot = merged.entry((e.file, e.target)).or_default();
       slot.0.insert(e.directive);
       slot.1.insert(e.uri);
-      slot.2.extend(e.entities_used);
+      for u in e.entities_used {
+        slot.2.entry(u.name).or_default().extend(u.lines);
+      }
     }
     merged
       .into_iter()
@@ -309,7 +314,7 @@ impl<'a> Tables<'a> {
         target,
         directive: directives.into_iter().collect::<Vec<_>>().join(","),
         uri: uris.into_iter().collect::<Vec<_>>().join(", "),
-        entities_used: used.into_iter().collect(),
+        entities_used: EntityUse::from_map(used),
       })
       .collect()
   }

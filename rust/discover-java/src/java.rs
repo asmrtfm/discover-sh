@@ -103,7 +103,11 @@ pub fn extract(root: &Root) -> Facts {
           .ancestors()
           .any(|a| matches!(a.kind().as_ref(), "import_declaration" | "package_declaration"));
         if !in_header {
-          facts.idents.insert(node.text().to_string());
+          facts
+            .idents
+            .entry(node.text().to_string())
+            .or_default()
+            .insert(node.start_pos().line() + 1);
         }
       }
       _ => {}
@@ -206,8 +210,8 @@ record R(int x) {}
     );
     assert_eq!(f.decls[0].header, "public class C {");
     assert!(f.main);
-    assert!(f.idents.contains("F") && f.idents.contains("Helper"));
+    assert!(f.idents.contains_key("F") && f.idents.contains_key("Helper"));
     // Names in the package and import declarations are not references.
-    assert!(!f.idents.contains("e") && !f.idents.contains("b"));
+    assert!(!f.idents.contains_key("e") && !f.idents.contains_key("b"));
   }
 }

@@ -127,7 +127,11 @@ pub fn extract(root: &Root) -> Facts {
           .ancestors()
           .any(|a| matches!(a.kind().as_ref(), "import_header" | "package_header"));
         if !in_header {
-          facts.idents.insert(node.text().to_string());
+          facts
+            .idents
+            .entry(node.text().to_string())
+            .or_default()
+            .insert(node.start_pos().line() + 1);
         }
       }
       _ => {}
@@ -238,9 +242,9 @@ class C {
       ]
     );
     assert!(f.main);
-    assert!(f.idents.contains("Bar") && f.idents.contains("Foo"));
+    assert!(f.idents.contains_key("Bar") && f.idents.contains_key("Foo"));
     // Names in the import header are not references.
-    assert!(!f.idents.contains("x"));
+    assert!(!f.idents.contains_key("x"));
   }
 
   #[test]

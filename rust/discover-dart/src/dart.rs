@@ -240,15 +240,19 @@ fn variable_entity(node: &DartNode<'_>) -> Entity {
   }
 }
 
-/// Whether a pattern matches anywhere outside the file's directives. Used to
-/// decide if an importer references an entity by name: a `show Foo`
-/// combinator names Foo without using it.
-pub fn references(root: &DartRoot, pattern: &Pattern) -> bool {
-  root.root().find_all(pattern).any(|m| {
-    !m.get_node()
-      .ancestors()
-      .any(|a| a.kind() == "import_or_export")
-  })
+/// The 1-based lines, ascending and without duplicates, where a pattern matches outside the file's directives. Used to find where an importer references an entity by name: a `show Foo` combinator names Foo without using it.
+pub fn references(root: &DartRoot, pattern: &Pattern) -> Vec<usize> {
+  let lines: std::collections::BTreeSet<usize> = root
+    .root()
+    .find_all(pattern)
+    .filter(|m| {
+      !m.get_node()
+        .ancestors()
+        .any(|a| a.kind() == "import_or_export")
+    })
+    .map(|m| m.get_node().start_pos().line() + 1)
+    .collect();
+  lines.into_iter().collect()
 }
 
 /// One pattern match, shaped like ast-grep's JSON output fields the bash
@@ -354,8 +358,9 @@ class C { void method() {} }
   fn show_combinator_is_not_a_reference() {
     let root = parse("import 'a.dart' show Foo;\nvoid f() {}\n");
     let pattern = Pattern::try_new("Foo", Dart).unwrap();
-    assert!(!references(&root, &pattern));
+    assert!(references(&root, &pattern).is_empty());
+    // The use on line 2 is reported; the combinator on line 1 is not.
     let root = parse("import 'a.dart' show Foo;\nvoid f() { Foo(); }\n");
-    assert!(references(&root, &pattern));
+    assert_eq!(references(&root, &pattern), vec![2]);
   }
 }

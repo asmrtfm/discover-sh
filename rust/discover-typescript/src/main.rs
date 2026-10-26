@@ -170,6 +170,7 @@ fn cmd_definition(graph: &Graph, args: &[String]) -> Result<u8, String> {
       line: e.line,
       via: None,
       source: Some("local"),
+      code: None,
     });
     return Ok(0);
   }
@@ -251,6 +252,7 @@ fn search_definition(
       line: e.line,
       via: Some(via),
       source: None,
+      code: None,
     });
     return true;
   }

@@ -5,11 +5,11 @@
 //! trace come from discover-core.
 
 use crate::dart::{self, Directive, Facts};
-use crate::project::Project;
+use crate::project::{Project, generated_extensions};
 use ast_grep_core::Pattern;
 use ast_grep_language::Dart;
 use discover_core::cache::{Caches, Fnv};
-use discover_core::graph::{Importers, Lang, Row};
+use discover_core::graph::{EntityUse, Importers, Lang, Row};
 use discover_core::memo::Memo;
 use discover_core::par::par_map;
 use std::collections::HashSet;
@@ -68,6 +68,16 @@ impl DartLang {
     let rel = self.project.resolve_uri(uri, from_rel)?;
     self.project.existing(&rel)
   }
+
+  /// A file's entity names followed by those of its generated extensions
+  /// (`*.g.dart`, `*.freezed.dart`), which are part of the same file.
+  fn entity_names_with_generated(&self, path: &Path) -> Vec<String> {
+    let mut names = self.facts(path).entity_names();
+    for generated in generated_extensions(path) {
+      names.extend(self.facts(&generated).entity_names());
+    }
+    names
+  }
 }
 
 impl Lang for DartLang {
@@ -86,7 +96,7 @@ impl Lang for DartLang {
   }
 
   fn entity_names(&self, path: &Path) -> Vec<String> {
-    self.facts(path).entity_names()
+    self.entity_names_with_generated(path)
   }
 
   // ─────────────────────────────────────────────────────────
@@ -147,14 +157,14 @@ impl Lang for DartLang {
           let Some(target) = self.resolve(uri, &file_rel) else {
             continue;
           };
+          // Each of the target's entities the importer references, with the lines where it does.
           let entities_used = self
-            .facts(&target)
-            .entity_names()
+            .entity_names_with_generated(&target)
             .into_iter()
-            .filter(|name| {
-              self
-                .pattern(name)
-                .is_some_and(|p| dart::references(&root, &p))
+            .filter_map(|name| {
+              let pattern = self.pattern(&name)?;
+              let lines = dart::references(&root, &pattern);
+              (!lines.is_empty()).then_some(EntityUse { name, lines })
             })
             .collect();
           rows.push((

@@ -5,6 +5,28 @@ use discover_core::project::{self, relative};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Suffixes of the files code generators write next to a base file.
+const GENERATED: [&str; 2] = [".g.dart", ".freezed.dart"];
+
+/// Whether a file name is a generated extension of a base file.
+pub fn is_generated(name: &str) -> bool {
+  GENERATED.iter().any(|s| name.ends_with(s))
+}
+
+/// The generated extensions of a base file that exist (`foo.dart` →
+/// `foo.g.dart`, `foo.freezed.dart`). Their declarations count as the base
+/// file's own.
+pub fn generated_extensions(base: &Path) -> Vec<PathBuf> {
+  let Some(stem) = base.to_str().and_then(|p| p.strip_suffix(".dart")) else {
+    return Vec::new();
+  };
+  GENERATED
+    .iter()
+    .map(|s| PathBuf::from(format!("{stem}{s}")))
+    .filter(|p| p.is_file())
+    .collect()
+}
+
 pub struct Project {
   /// The directory the command is run from, canonical.
   pub root: PathBuf,
@@ -42,13 +64,15 @@ impl Project {
   }
 
   /// The source files under analysis: every *.dart under lib/ except
-  /// generated *.g.dart / *.freezed.dart, sorted, as canonical paths.
+  /// generated *.g.dart / *.freezed.dart, sorted, as canonical paths. The
+  /// generated files are extensions of their base file, not files of their
+  /// own (see [`generated_extensions`]).
   /// Like `find`, symlinked directories are not descended into.
   pub fn relevant_files(&self) -> Vec<PathBuf> {
     let mut found = Vec::new();
     project::walk(&self.lib, &[], &mut |path, _| {
       let name = path.file_name().unwrap_or_default().to_string_lossy();
-      if name.ends_with(".dart") && !name.ends_with(".g.dart") && !name.ends_with(".freezed.dart") {
+      if name.ends_with(".dart") && !is_generated(&name) {
         found.push(path.to_path_buf());
       }
     });

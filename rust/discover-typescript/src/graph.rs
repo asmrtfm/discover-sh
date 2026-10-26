@@ -2,21 +2,14 @@
 //! (reachability from the entry points over import, export and dynamic
 //! directives), and the importers index. Caching, dead files and trace come
 //! from discover-core.
-//!
-//! Besides entity names, an importer's `entities_used` carries markers for
-//! references that have no name to match:
-//!   "default"       — a default-import binding that the importer uses
-//!   "*"             — `export * from` re-exports everything
-//!   "(side-effect)" — `import "./x"` runs the module for its effects
-//!   "(dynamic)"     — import()/require(), consumed at runtime
 
 use crate::project::Project;
 use crate::ts::{self, Directive, Facts, is_script};
 use discover_core::cache::{Caches, Fnv};
-use discover_core::graph::{Importers, Lang, Row};
+use discover_core::graph::{EntityUse, Importers, Lang, Row};
 use discover_core::memo::Memo;
 use discover_core::par::par_map;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,6 +77,12 @@ impl Lang for TsLang {
     self.facts(path).entity_names()
   }
 
+  /// TypeScript and JavaScript modules; images, JSON, styles and other
+  /// files an import can resolve to are assets.
+  fn is_source(&self, path: &Path) -> bool {
+    is_script(&path.to_string_lossy())
+  }
+
   // ─────────────────────────────────────────────────────────
   // live files — breadth-first reachability from the entry
   // points over import, export and dynamic directives
@@ -141,11 +140,7 @@ impl Lang for TsLang {
           let Some(target) = self.resolve(&spec.text, &file_rel) else {
             continue;
           };
-          let entities_used = if directive == Directive::Dynamic {
-            vec!["(dynamic)".to_string()]
-          } else {
-            used_entities(&facts, &self.facts(&target), &spec.text, directive)
-          };
+          let entities_used = used_entities(&facts, &self.facts(&target), &spec.text, directive);
           rows.push((
             self.project.rel(&target),
             Row {
@@ -169,34 +164,31 @@ impl Lang for TsLang {
   }
 }
 
-/// Which of the target's entities an importer uses through one specifier:
-/// entity names it references, plus the markers documented at the top.
-fn used_entities(importer: &Facts, target: &Facts, uri: &str, directive: Directive) -> Vec<String> {
-  let mine: Vec<_> = importer
-    .bindings
-    .iter()
-    .filter(|b| b.src.as_deref() == Some(uri))
-    .collect();
-  let mut used: BTreeSet<String> = target
+/// The target's entities an importer uses through one specifier, each with
+/// the importer's lines where it is used: the ones it references by name,
+/// and the entity the target exports as default when the importer uses its
+/// default-import binding (lines where that local binding is used).
+fn used_entities(importer: &Facts, target: &Facts, uri: &str, directive: Directive) -> Vec<EntityUse> {
+  let mut used: BTreeMap<String, BTreeSet<usize>> = target
     .entity_names()
     .into_iter()
-    .filter(|n| importer.idents.contains(n))
+    .filter_map(|n| importer.idents.get(&n).map(|lines| (n, lines.clone())))
     .collect();
-  if directive == Directive::Export && mine.iter().any(|b| b.id == "export-star") {
-    used.insert("*".to_string());
-  }
   if directive == Directive::Import {
-    if mine.iter().any(|b| b.id == "import-bare") {
-      used.insert("(side-effect)".to_string());
-    }
-    let default_used = mine.iter().any(|b| {
-      b.id == "import-default" && b.local.as_ref().is_some_and(|l| importer.idents.contains(l))
-    });
-    if default_used {
-      used.insert("default".to_string());
+    // Lines where any default-import binding of this specifier is used.
+    let default_lines: BTreeSet<usize> = importer
+      .bindings
+      .iter()
+      .filter(|b| b.id == "import-default" && b.src.as_deref() == Some(uri))
+      .filter_map(|b| importer.idents.get(b.local.as_ref()?))
+      .flatten()
+      .copied()
+      .collect();
+    if let Some(name) = target.default_export().filter(|n| !default_lines.is_empty() && target.entity(n).is_some()) {
+      used.entry(name.to_string()).or_default().extend(default_lines);
     }
   }
-  used.into_iter().collect()
+  EntityUse::from_map(used)
 }
 
 /// FNV-1a over the source listing, the entry points and tsconfig.json

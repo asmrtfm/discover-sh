@@ -5,7 +5,7 @@
 use ast_grep_core::tree_sitter::{LanguageExt, StrDoc};
 use ast_grep_core::{AstGrep, Node};
 use ast_grep_language::SupportLang;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub type TsRoot = AstGrep<StrDoc<SupportLang>>;
@@ -96,8 +96,9 @@ pub struct Facts {
   /// Sorted by line.
   pub entities: Vec<Entity>,
   /// Distinct names referenced outside import statements: values, types,
-  /// member access (`ns.Foo`) and JSX tags.
-  pub idents: BTreeSet<String>,
+  /// member access (`ns.Foo`) and JSX tags, each with the 1-based lines
+  /// where it appears.
+  pub idents: BTreeMap<String, BTreeSet<usize>>,
   pub bindings: Vec<Binding>,
 }
 
@@ -254,7 +255,7 @@ pub fn extract(root: &TsRoot) -> Facts {
       }
       "identifier" | "type_identifier" | "property_identifier" | "shorthand_property_identifier" => {
         if !node.ancestors().any(|a| a.kind() == "import_statement") {
-          facts.idents.insert(node.text().to_string());
+          facts.idents.entry(node.text().to_string()).or_default().insert(line_of(&node));
         }
       }
       _ => {}
@@ -524,7 +525,8 @@ export default function App() {}
   #[test]
   fn names_in_imports_are_not_references() {
     let f = facts("import { Foo } from './foo';\nconst x = <Bar />;\n", SupportLang::Tsx);
-    assert!(!f.idents.contains("Foo"));
-    assert!(f.idents.contains("Bar"));
+    assert!(!f.idents.contains_key("Foo"));
+    // Bar is referenced on line 2.
+    assert_eq!(f.idents.get("Bar").map(|l| l.iter().copied().collect::<Vec<_>>()), Some(vec![2]));
   }
 }

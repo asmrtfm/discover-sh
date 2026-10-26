@@ -3,7 +3,7 @@
 //! is-live, importers, trace, prune). A language adds resolve, inspect,
 //! definition and usages.
 
-use crate::graph::{Graph, Lang, Row, Trace};
+use crate::graph::{EntityUse, Graph, Lang, Row, Trace};
 use crate::project::{relative, to_abs};
 use crate::usages::Usage;
 use serde::Serialize;
@@ -269,6 +269,64 @@ pub struct DefinitionOut<'a> {
   pub via: Option<&'a [String]>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub source: Option<&'a str>,
+  /// The whole declaration, with `--verbose`.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub code: Option<&'a str>,
+}
+
+pub struct DefinitionArgs<'a> {
+  pub symbol: &'a str,
+  /// The file the symbol is used in; without it every definition in the
+  /// project is reported.
+  pub file: Option<&'a str>,
+  /// `-v` / `--verbose`: include each definition's code.
+  pub verbose: bool,
+  /// `-p` / `--pretty`: print each definition as a header line and its code
+  /// as written instead of JSON. Implies `verbose`.
+  pub pretty: bool,
+}
+
+/// `definition <symbol> [<file>] [-v|--verbose] [-p|--pretty]`.
+pub fn parse_definition<'a, L: Lang>(args: &'a [String]) -> Result<DefinitionArgs<'a>, String> {
+  let usage = || format!("usage: {} definition <symbol> [<file>] [-v|--verbose] [-p|--pretty]", L::NAME);
+  let mut verbose = false;
+  let mut pretty = false;
+  let mut positional = Vec::new();
+  for arg in args {
+    match arg.as_str() {
+      "-v" | "--verbose" => verbose = true,
+      "-p" | "--pretty" => pretty = true,
+      other => positional.push(other),
+    }
+  }
+  // Pretty output is the code, so it needs the code.
+  verbose |= pretty;
+  match positional[..] {
+    [symbol] => Ok(DefinitionArgs { symbol, file: None, verbose, pretty }),
+    [symbol, file] => Ok(DefinitionArgs { symbol, file: Some(file), verbose, pretty }),
+    _ => Err(usage()),
+  }
+}
+
+/// `--pretty` output for one definition: a `file:line kind symbol` header
+/// (with the re-export chain, when there is one), then its code as written.
+pub fn out_pretty_definition(def: &DefinitionOut) {
+  let mut header = format!("{}:{} {} {}", def.file, def.line, def.kind, def.symbol);
+  if let Some(via) = def.via.filter(|v| !v.is_empty()) {
+    header.push_str(&format!(" (via {})", via.join(" -> ")));
+  }
+  out(&header);
+  out(def.code.unwrap_or_default());
+  out("");
+}
+
+/// One definition, as JSON or with `--pretty`.
+pub fn out_definition(def: &DefinitionOut, pretty: bool) {
+  if pretty {
+    out_pretty_definition(def);
+  } else {
+    out_json(def);
+  }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -311,7 +369,7 @@ struct TracedRow {
   file: String,
   directive: String,
   uri: String,
-  entities_used: Vec<String>,
+  entities_used: Vec<EntityUse>,
   status: &'static str,
 }
 
@@ -329,6 +387,12 @@ struct TraceOut {
 fn cmd_trace<L: Lang>(graph: &Graph<L>, args: &[String]) -> Result<u8, String> {
   let file = args.first().ok_or(format!("usage: {} trace <file>", L::NAME))?;
   let (path, rel) = file_arg(graph.root(), file)?;
+  if !graph.is_source(&path) {
+    return Err(format!(
+      "not a source file: {file} (trace is for code; for assets use: {} usages --assets <path>)",
+      L::NAME
+    ));
+  }
   let entities = graph.entity_names(&path);
   let index = graph.importers()?;
   let mut trace = Trace::new(&index, graph.entries());

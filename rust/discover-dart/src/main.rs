@@ -7,7 +7,7 @@
 //! Subcommands:
 //!   resolve <uri> [--from <file>]
 //!   inspect <file> [--imports] [--exports] [--parts] [--entities] [--depth names|signatures|full]
-//!   definition <file> <symbol>
+//!   definition <symbol> [<file>] [-v|--verbose] [-p|--pretty]
 //!   live-files
 //!   dead-files [--rebuild]
 //!   is-live <file>
@@ -22,16 +22,18 @@ mod graph;
 mod project;
 mod usages;
 
-use dart::Directive;
+use dart::{Directive, Facts};
 use discover_core::cli::{
-  self, DefinitionOut, EntityOut, UsagesArgs, file_arg, out, out_json, parse_inspect, parse_resolve, parse_usages,
+  self, DefinitionArgs, DefinitionOut, EntityOut, UsagesArgs, file_arg, out, out_definition, out_json,
+  out_pretty_definition, parse_definition, parse_inspect, parse_resolve, parse_usages,
 };
 use graph::{DartLang, Graph};
-use project::Project;
+use project::{Project, generated_extensions};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 const USAGE: &str = "usage: discover-dart [--rebuild-cache] <command> [args]
 
@@ -42,7 +44,11 @@ commands:
   resolve <uri> [--from <file>]          Resolve import URI to repo-relative path
   inspect <file> [--imports] [--exports] [--parts] [--entities]
            [--depth names|signatures|full]
-  definition <file> <symbol>             Find where a symbol used in <file> is defined
+  definition <symbol> [<file>] [-v|--verbose] [-p|--pretty]
+                                         Find where a symbol used in <file> is defined;
+                                         without <file>, every definition in the project
+                                         (--verbose adds each definition's code;
+                                         --pretty prints the code as written, not JSON)
   live-files                             List all files reachable from main.dart
   dead-files [--rebuild]                 List all dead files (verified by recursive trace)
   is-live <file>                         Check if a file is reachable from main.dart
@@ -143,25 +149,29 @@ fn cmd_inspect(graph: &Graph, args: &[String]) -> Result<u8, String> {
 }
 
 // ─────────────────────────────────────────────────────────
-// definition — local entities first, then each import,
-// following re-exports; then part files
+// definition — with a file: local entities first, then each
+// import, following re-exports; then part files. Without one:
+// every definition of the symbol in the project
 // ─────────────────────────────────────────────────────────
 fn cmd_definition(graph: &Graph, args: &[String]) -> Result<u8, String> {
-  let (Some(file), Some(symbol)) = (args.first(), args.get(1)) else {
-    return Err("usage: discover-dart definition <file> <symbol>".into());
+  let DefinitionArgs { symbol, file, verbose, pretty } = parse_definition::<DartLang>(args)?;
+  let Some(file) = file else {
+    return all_definitions(graph, symbol, verbose, pretty);
   };
   let (path, rel) = file_arg(&graph.project.root, file)?;
   let facts = graph.facts(&path);
 
   if let Some(e) = facts.entity(symbol) {
-    out_json(&DefinitionOut {
+    let def = DefinitionOut {
       symbol,
       kind: e.kind,
       file: &rel,
       line: e.line,
       via: None,
       source: Some("local"),
-    });
+      code: verbose.then_some(e.full.as_str()),
+    };
+    out_definition(&def, pretty);
     return Ok(0);
   }
 
@@ -172,7 +182,8 @@ fn cmd_definition(graph: &Graph, args: &[String]) -> Result<u8, String> {
       let Some(resolved) = graph.project.resolve_uri(uri, &rel) else {
         continue;
       };
-      if search_definition(graph, symbol, &graph.project.root.join(resolved), &via, &mut visited) {
+      let path = graph.project.root.join(resolved);
+      if search_definition(graph, symbol, &path, &via, (verbose, pretty), &mut visited) {
         return Ok(0);
       }
     }
@@ -182,15 +193,61 @@ fn cmd_definition(graph: &Graph, args: &[String]) -> Result<u8, String> {
   Ok(1)
 }
 
+/// Every declaration of `symbol` in the project's source files and their
+/// generated extensions (`*.g.dart`, `*.freezed.dart`), in file order.
+fn all_definitions(graph: &Graph, symbol: &str, verbose: bool, pretty: bool) -> Result<u8, String> {
+  let files: Vec<(String, Arc<Facts>)> = graph
+    .project
+    .relevant_files()
+    .into_iter()
+    .flat_map(|base| {
+      let mut files = vec![base.clone()];
+      files.extend(generated_extensions(&base));
+      files
+    })
+    .map(|path| (graph.project.rel(&path), graph.facts(&path)))
+    .collect();
+
+  let found: Vec<DefinitionOut> = files
+    .iter()
+    .flat_map(|(rel, facts)| {
+      facts.entities.iter().filter(|e| e.name == symbol).map(move |e| DefinitionOut {
+        symbol,
+        kind: e.kind,
+        file: rel,
+        line: e.line,
+        via: None,
+        source: None,
+        code: verbose.then_some(e.full.as_str()),
+      })
+    })
+    .collect();
+
+  if found.is_empty() {
+    out_json(&serde_json::json!({ "symbol": symbol, "error": "not found in project" }));
+    return Ok(1);
+  }
+  if pretty {
+    found.iter().for_each(out_pretty_definition);
+  } else {
+    out_json(&found);
+  }
+  eprintln!("{} definition(s) found", found.len());
+  Ok(0)
+}
+
 /// Looks for `symbol` among a file's entities, then down its re-exports.
-/// `via` is the chain of re-exporting files walked so far.
+/// `via` is the chain of re-exporting files walked so far; `output` is
+/// `(verbose, pretty)`.
 fn search_definition(
   graph: &Graph,
   symbol: &str,
   path: &Path,
   via: &[String],
+  output: (bool, bool),
   visited: &mut HashSet<PathBuf>,
 ) -> bool {
+  let (verbose, pretty) = output;
   let Ok(path) = std::fs::canonicalize(path) else {
     return false;
   };
@@ -200,14 +257,16 @@ fn search_definition(
   let rel = graph.project.rel(&path);
   let facts = graph.facts(&path);
   if let Some(e) = facts.entity(symbol) {
-    out_json(&DefinitionOut {
+    let def = DefinitionOut {
       symbol,
       kind: e.kind,
       file: &rel,
       line: e.line,
       via: Some(via),
       source: None,
-    });
+      code: verbose.then_some(e.full.as_str()),
+    };
+    out_definition(&def, pretty);
     return true;
   }
   for uri in facts.uris(Directive::Export) {
@@ -216,7 +275,7 @@ fn search_definition(
     };
     let mut chain = via.to_vec();
     chain.push(rel.clone());
-    if search_definition(graph, symbol, &target, &chain, visited) {
+    if search_definition(graph, symbol, &target, &chain, output, visited) {
       return true;
     }
   }

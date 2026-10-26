@@ -15,9 +15,25 @@ pub struct Row {
   pub file: String,
   pub directive: String,
   pub uri: String,
-  /// The target's entities this importer references (a language may add
-  /// markers for references that have no name; see its crate).
-  pub entities_used: Vec<String>,
+  /// The target's entities this importer references, each with the lines in the importer where it is used.
+  pub entities_used: Vec<EntityUse>,
+}
+
+/// One of the target's entities that an importer uses, and every 1-based line in the importer where it is used, ascending and without duplicates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityUse {
+  pub name: String,
+  pub lines: Vec<usize>,
+}
+
+impl EntityUse {
+  /// Builds the sorted list of entity uses from a name → lines map.
+  pub fn from_map(map: BTreeMap<String, std::collections::BTreeSet<usize>>) -> Vec<EntityUse> {
+    map
+      .into_iter()
+      .map(|(name, lines)| EntityUse { name, lines: lines.into_iter().collect() })
+      .collect()
+  }
 }
 
 /// target (repo-relative) → the files that depend on it.
@@ -40,6 +56,12 @@ pub trait Lang {
 
   /// Names of a file's top-level entities, in declaration order.
   fn entity_names(&self, path: &Path) -> Vec<String>;
+
+  /// Whether a file is source code that `trace` can follow. Assets are not;
+  /// `usages --assets` looks those up.
+  fn is_source(&self, _path: &Path) -> bool {
+    true
+  }
 
   /// Every file reachable from the entry points, repo-relative and sorted.
   fn compute_live(&self, caches: &Caches) -> Result<Vec<String>, String>;
