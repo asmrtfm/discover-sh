@@ -1,0 +1,19 @@
+[package]
+name = "discover-java"
+description = "Deterministic Java codebase navigation (declaration index, liveness, usages) built on ast-grep"
+publish = false
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# Parsing and pattern matching run in-process with ast-grep's Java support.
+ast-grep-core = { workspace = true, features = ["tree-sitter"] }
+ast-grep-language.workspace = true
+# The Language struct this crate identifies itself to the discover binary with.
+discover-core = { path = "../discover-core" }
+# Everything but reading a Java parse tree, shared with Kotlin.
+discover-jvm = { path = "../discover-jvm" }

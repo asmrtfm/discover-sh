@@ -1,0 +1,19 @@
+[package]
+name = "discover-jvm"
+description = "The JVM navigators' shared half (Java, Kotlin): declaration index, name resolution, Android/ServiceLoader entry points, usages and subcommands"
+publish = false
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# Parsing and pattern matching run in-process with ast-grep's JVM language support.
+ast-grep-core = { workspace = true, features = ["tree-sitter"] }
+ast-grep-language.workspace = true
+# Caches, liveness, the importers index, trace and the shared CLI.
+discover-core = { path = "../discover-core" }
+serde.workspace = true
+serde_json = "1.0.116"

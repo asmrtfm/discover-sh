@@ -39,6 +39,29 @@ SKILL_EXAMPLE_SYMBOL="AppDelegate"
 SKILL_USAGE_EXAMPLE_1='URLSession.shared.$METHOD($$$ARGS)'
 SKILL_USAGE_EXAMPLE_2='guard let $VAR = $EXPR else { $$$BODY }'
 
+# Swift-specific SKILL.md overrides.
+# Swift has no file-level imports within a target — all files in a module see
+# each other implicitly. The generic import-graph descriptions are misleading.
+SKILL_LIVE_FILES_DESC="Lists all .swift files in modules reachable from the app target. In Swift, all files within a module/target see each other implicitly — there are no file-level imports to trace. For single-target projects, every file is live."
+SKILL_IS_LIVE_DESC="Check whether a file belongs to a module reachable from the app target. For single-target projects this is always true — use \`usages\` and call-chain tracing instead to detect dead code."
+SKILL_USAGES_LIVE_DESC="\`--live-only\` filters to files in reachable modules. For single-target projects this has no effect (all files are in scope). To verify callsites are actually active, use \`trace\` instead — it follows the call chain upward through containing functions automatically."
+SKILL_EXTRA_SUBCOMMANDS='### trace
+
+Trace the call chain upward from each callsite of a symbol. For each place the symbol is called, identifies the containing function, finds callers of *that* function, and repeats — building a chain that shows whether the callsite is reachable or dead code. This is the correct way to verify reachability in Swift (where `--live-only` only checks module membership).
+
+```bash
+bash {{SCRIPT_PATH}} trace getDrinksBatch
+bash {{SCRIPT_PATH}} trace resolveRelationships --max-depth 5
+```
+
+Output per callsite includes: the file/line, the containing function (qualified as `Type.method`), the caller chain, and a status (`end` = chain terminated, `cycle` = recursion detected, `max_depth` = limit hit). A chain ending with "no callers found" means either a framework entry point or dead code — inspect the top of the chain to decide which.'
+SKILL_RULES='- Use `usages` instead of grep for structural search — it matches AST nodes, not text.
+- Use `trace` to verify whether callsites are reachable. It follows the call chain upward from each callsite, identifying the containing function at each level, until it reaches an entry point or dead-ends. A chain ending with "no callers found" means either a framework entry point (the system calls it) or dead code.
+- Use `definition` before assuming which file a symbol comes from — Swift has no file-level namespacing, so the same name can exist in multiple modules.
+- Use `modules` and `module-of` to understand the target/module graph.
+- `--live-only` only filters by module membership, NOT by call-graph reachability. For single-target projects it filters nothing. Use `trace` instead.
+- Never claim a callsite is "verified live" just because `usages --live-only` returned it — that only means the file is in a reachable module. Use `trace` for actual verification.'
+
 # ─────────────────────────────────────────────────────────
 # Module graph data (populated lazily by _swift_load_modules)
 # ─────────────────────────────────────────────────────────
@@ -610,6 +633,240 @@ cmd_module_of() {
         echo "unknown (file not in any module's source directory)" >&2
         return 1
     fi
+}
+
+# ─────────────────────────────────────────────────────────
+# Call-chain tracing helpers
+#
+# Swift has no file-level imports within a target, so --live-only on usages
+# only checks module membership (always true for single-target). To actually
+# verify a callsite is reachable, we trace through containing functions.
+# ─────────────────────────────────────────────────────────
+
+# Given an absolute file path and a 0-indexed line number, return the name of
+# the function or initializer that contains that line. Returns empty if the
+# line is at the top level or inside a non-function context (property, etc.).
+_swift_containing_function() {
+    local file="$1" target_line="$2"
+
+    # Collect function_declaration and init_declaration ranges
+    local fn_raw init_raw all_funcs="[]"
+
+    fn_raw="$(ast-grep run -l swift --kind function_declaration "$file" --json 2>/dev/null)"
+    if [ -n "$fn_raw" ] && [ "$fn_raw" != "[]" ]; then
+        # Scan all lines for `func` — attributes like @MainActor can push it
+        # past the first line of the function_declaration node.
+        all_funcs="$(echo "$fn_raw" | jq '[.[] | {
+            name: ([.text | split("\n")[] | capture("func\\s+(?<n>\\w+)")?] | map(select(. != null)) | .[0].n),
+            start: .range.start.line,
+            end: .range.end.line
+        } | select(.name != null)]')"
+    fi
+
+    init_raw="$(ast-grep run -l swift --kind init_declaration "$file" --json 2>/dev/null)"
+    if [ -n "$init_raw" ] && [ "$init_raw" != "[]" ]; then
+        local init_funcs
+        init_funcs="$(echo "$init_raw" | jq '[.[] | {
+            name: "init",
+            start: .range.start.line,
+            end: .range.end.line
+        }]')"
+        all_funcs="$(echo "$all_funcs" "$init_funcs" | jq -s '.[0] + .[1]')"
+    fi
+
+    # Find the innermost function whose range contains target_line
+    echo "$all_funcs" | jq -r --argjson line "$target_line" '
+        [.[] | select(.start <= $line and .end >= $line)] |
+        sort_by(.end - .start) | .[0].name // empty
+    '
+}
+
+# Given an absolute file path and a 0-indexed line, return the enclosing
+# type name (class/struct/enum/actor/extension) or empty if top-level.
+_swift_containing_type() {
+    local file="$1" target_line="$2"
+    local types_raw
+    types_raw="$(ast-grep run -l swift --kind class_declaration "$file" --json 2>/dev/null)"
+    [ -n "$types_raw" ] && [ "$types_raw" != "[]" ] || return
+    echo "$types_raw" | jq -r --argjson line "$target_line" '
+        [.[] |
+            (.text | split("\n")[0] |
+                capture("(?<kw>struct|class|enum|actor|extension)\\s+(?<n>\\w+)")) as $cap |
+            select($cap != null) |
+            select(.range.start.line <= $line and .range.end.line >= $line) |
+            {name: $cap.n, start: .range.start.line, end: .range.end.line}
+        ] | sort_by(.end - .start) | .[0].name // empty
+    '
+}
+
+# ─────────────────────────────────────────────────────────
+# Subcommand: trace — call-chain verification
+#
+# Given a symbol, finds all callsites (excluding definitions) and traces
+# upward through containing functions to build a caller chain. Each level
+# asks: "what function contains this call, and who calls that function?"
+#
+# This is the correct way to verify reachability in Swift, where file-level
+# import tracing is meaningless (all files in a target see each other).
+#
+# Usage:
+#   discover-swift.sh trace <symbol> [--max-depth N] [--json]
+# ─────────────────────────────────────────────────────────
+cmd_trace() {
+    local symbol="" max_depth=8 json_mode=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --max-depth) shift; max_depth="$1" ;;
+            --json)      json_mode=true ;;
+            *) symbol="$1" ;;
+        esac
+        shift
+    done
+    [ -n "$symbol" ] || die "usage: discover.sh trace <symbol> [--max-depth N] [--json]"
+
+    # Find all occurrences of the symbol
+    local raw
+    raw="$(ast-grep run -l swift -p "$symbol" "$REPO_ROOT" --json 2>/dev/null)"
+    [ -n "$raw" ] && [ "$raw" != "[]" ] || {
+        echo "[]"
+        $json_mode || echo "0 callsites found" >&2
+        return
+    }
+
+    local results="[]"
+    local callsite_count=0
+
+    # Process each occurrence — skip definitions, trace callsites
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        local file line text
+        file="$(echo "$entry" | jq -r '.file')"
+        line="$(echo "$entry" | jq -r '.range.start.line')"
+        text="$(echo "$entry" | jq -r '.lines | split("\n")[0]')"
+        local trimmed_text="${text#"${text%%[![:space:]]*}"}"
+        local rel_file="${file#$REPO_ROOT/}"
+
+        # Skip definitions: lines that start with `func <symbol>`
+        if [[ "$trimmed_text" =~ ^(public|open|internal|private|fileprivate|package|static|class|override|@[a-zA-Z]+\ )*(func|init)\ +"$symbol" ]]; then
+            continue
+        fi
+
+        # Find the containing function for this callsite
+        local container
+        container="$(_swift_containing_function "$file" "$line")"
+        local container_type
+        container_type="$(_swift_containing_type "$file" "$line")"
+        local qualified="${container_type:+${container_type}.}${container:-top-level}"
+
+        # Trace upward through callers
+        local chain="[]"
+        local current_func="$container"
+        local current_file="$file"
+        local status="traced"
+        local depth=0
+
+        # Track visited to avoid cycles (key = function name)
+        declare -A _trace_seen=()
+
+        while [ -n "$current_func" ] && [ "$depth" -lt "$max_depth" ]; do
+            [ -z "${_trace_seen[$current_func]+_}" ] || { status="cycle"; break; }
+            _trace_seen["$current_func"]=1
+
+            # Search for callers of current_func across the repo
+            local caller_raw
+            caller_raw="$(ast-grep run -l swift -p "$current_func" "$REPO_ROOT" --json 2>/dev/null)"
+
+            if [ -z "$caller_raw" ] || [ "$caller_raw" = "[]" ]; then
+                status="end"
+                chain="$(echo "$chain" | jq --arg f "$current_func" \
+                    '. + [{function: $f, note: "no references found"}]')"
+                break
+            fi
+
+            # Find a caller that is NOT a definition of current_func
+            local found_caller=false
+            while IFS= read -r caller_entry; do
+                [ -n "$caller_entry" ] || continue
+                local c_file c_line c_text
+                c_file="$(echo "$caller_entry" | jq -r '.file')"
+                c_line="$(echo "$caller_entry" | jq -r '.range.start.line')"
+                c_text="$(echo "$caller_entry" | jq -r '.lines | split("\n")[0]')"
+                local c_trimmed="${c_text#"${c_text%%[![:space:]]*}"}"
+
+                # Skip definitions
+                if [[ "$c_trimmed" =~ ^(public|open|internal|private|fileprivate|package|static|class|override|@[a-zA-Z]+\ )*(func|init)\ +"$current_func" ]]; then
+                    continue
+                fi
+
+                local c_func
+                c_func="$(_swift_containing_function "$c_file" "$c_line")"
+
+                # Skip self-references (same function calling itself = recursion)
+                [ "$c_func" != "$current_func" ] || continue
+                # Must have a containing function
+                [ -n "$c_func" ] || continue
+
+                local c_type
+                c_type="$(_swift_containing_type "$c_file" "$c_line")"
+                local c_rel="${c_file#$REPO_ROOT/}"
+
+                chain="$(echo "$chain" | jq \
+                    --arg f "$current_func" \
+                    --arg caller "$c_func" \
+                    --arg caller_type "${c_type:-}" \
+                    --arg caller_file "$c_rel" \
+                    --argjson caller_line "$((c_line + 1))" \
+                    '. + [{
+                        function: $f,
+                        called_by: (if $caller_type != "" then ($caller_type + "." + $caller) else $caller end),
+                        in_file: $caller_file,
+                        at_line: $caller_line
+                    }]')"
+
+                current_func="$c_func"
+                current_file="$c_file"
+                found_caller=true
+                break
+            done < <(echo "$caller_raw" | jq -c '.[]')
+
+            if ! $found_caller; then
+                # No non-definition, non-self callers found.
+                # This function exists but nothing calls it — could be a
+                # framework entry point or dead code.
+                status="end"
+                chain="$(echo "$chain" | jq --arg f "$current_func" \
+                    '. + [{function: $f, note: "no callers found (entry point or dead code)"}]')"
+                break
+            fi
+
+            ((depth++))
+        done
+
+        if [ "$depth" -ge "$max_depth" ]; then
+            status="max_depth"
+        fi
+
+        unset _trace_seen
+
+        results="$(echo "$results" | jq \
+            --arg file "$rel_file" \
+            --argjson line "$((line + 1))" \
+            --arg text "$trimmed_text" \
+            --arg container "$qualified" \
+            --argjson chain "$chain" \
+            --arg status "$status" \
+            --argjson depth "$depth" \
+            '. + [{
+                callsite: {file: $file, line: $line, text: $text, in_function: $container},
+                chain: $chain,
+                status: $status,
+                depth: $depth
+            }]')"
+        ((callsite_count++))
+    done < <(echo "$raw" | jq -c '.[]')
+
+    echo "$results" | jq '.'
+    $json_mode || echo "$callsite_count callsites traced" >&2
 }
 
 # ─────────────────────────────────────────────────────────

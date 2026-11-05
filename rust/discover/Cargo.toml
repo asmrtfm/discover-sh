@@ -1,0 +1,23 @@
+[package]
+name = "discover"
+description = "Deterministic codebase navigation built on ast-grep: one binary that routes to a language with --lang=<lang>"
+publish = false
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "discover"
+path = "src/main.rs"
+
+[dependencies]
+# Parses the command line and provides the LANG global this binary routes on.
+discover-core = { path = "../discover-core" }
+# The languages this binary routes to.
+discover-dart = { path = "../discover-dart" }
+discover-java = { path = "../discover-java" }
+discover-kotlin = { path = "../discover-kotlin" }
+discover-typescript = { path = "../discover-typescript" }

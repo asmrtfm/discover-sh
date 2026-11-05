@@ -1,0 +1,15 @@
+[package]
+name = "discover-core"
+description = "Language-independent engine shared by the discover-* navigators: caches, liveness, the importers index, trace, and the common CLI"
+publish = false
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json = "1.0.116"
+serde_yaml = "0.9"

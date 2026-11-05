@@ -1,4 +1,0 @@
-schema: spec-driven
-created: 2026-07-07
-goal: Any structural claim made during openspec exploration or artifact creation
-  must be validated with discover before being stated as fact
