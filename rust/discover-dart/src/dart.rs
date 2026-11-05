@@ -49,13 +49,29 @@ pub struct Entity {
   pub full: String,
 }
 
+/// Anything declared with a name, at any depth: every entity, plus the methods, accessors, constructors and local functions that are not entities.
+#[derive(Debug)]
+pub struct Definition {
+  /// An entity's kind, or method | getter | setter | constructor
+  pub kind: &'static str,
+  pub name: String,
+  /// 1-based line of the node.
+  pub line: usize,
+  /// The whole declaration.
+  pub full: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Facts {
   pub imports: Vec<String>,
   pub exports: Vec<String>,
+  /// The 1-based line of the `export` directive each of `exports` is in, index for index.
+  pub export_lines: Vec<usize>,
   pub parts: Vec<String>,
   /// Sorted by line.
   pub entities: Vec<Entity>,
+  /// Sorted by line.
+  pub definitions: Vec<Definition>,
 }
 
 impl Facts {
@@ -67,9 +83,9 @@ impl Facts {
     }
   }
 
-  /// The first entity (by line) with this name.
-  pub fn entity(&self, name: &str) -> Option<&Entity> {
-    self.entities.iter().find(|e| e.name == name)
+  /// The first definition (by line) with this name.
+  pub fn definition(&self, name: &str) -> Option<&Definition> {
+    self.definitions.iter().find(|d| d.name == name)
   }
 
   pub fn entity_names(&self) -> Vec<String> {
@@ -92,17 +108,33 @@ pub fn extract(root: &DartRoot) -> Facts {
   let mut declarations: [Vec<Entity>; 5] = Default::default();
   let mut functions = Vec::new();
   let mut variables = Vec::new();
+  let mut member_definitions = Vec::new();
 
   // One pre-order walk; directives and entities come out in document order.
   for node in root.root().dfs() {
     let kind = node.kind();
     match kind.as_ref() {
       "library_import" => facts.imports.extend(uris_in(&node)),
-      "library_export" => facts.exports.extend(uris_in(&node)),
+      "library_export" => {
+        let uris = uris_in(&node);
+        let line = node.start_pos().line() + 1;
+        facts.export_lines.extend(std::iter::repeat_n(line, uris.len()));
+        facts.exports.extend(uris);
+      }
       "part_directive" => facts.parts.extend(uris_in(&node)),
       // Top-level functions only: methods are indented, so column 0 marks top level.
       "function_signature" if node.start_pos().column(&node) == 0 => {
         functions.push(function_entity(&node))
+      }
+      // Everything else with a signature has a definition without being an entity.
+      "function_signature" => {
+        let in_type = node.ancestors().any(|a| matches!(a.kind().as_ref(), "class_body" | "extension_body" | "enum_body"));
+        member_definitions.push(member_definition(&node, if in_type { "method" } else { "function" }));
+      }
+      "getter_signature" => member_definitions.push(member_definition(&node, "getter")),
+      "setter_signature" => member_definitions.push(member_definition(&node, "setter")),
+      "constructor_signature" | "factory_constructor_signature" => {
+        member_definitions.push(member_definition(&node, "constructor"))
       }
       "initialized_identifier" | "static_final_declaration" if is_top_level_variable(&node) => {
         variables.push(variable_entity(&node))
@@ -123,6 +155,18 @@ pub fn extract(root: &DartRoot) -> Facts {
     .collect();
   // Stable, so same-line entities keep the concatenation order above.
   entities.sort_by_key(|e| e.line);
+
+  // Every entity has a definition, on top of the ones that aren't entities.
+  let entity_definitions = entities.iter().map(|e| Definition {
+    kind: e.kind,
+    name: e.name.clone(),
+    line: e.line,
+    full: e.full.clone(),
+  });
+  let mut definitions: Vec<Definition> = entity_definitions.chain(member_definitions).collect();
+  // Stable, so an entity stays ahead of a member on the same line.
+  definitions.sort_by_key(|d| d.line);
+  facts.definitions = definitions;
   facts.entities = entities;
   facts
 }
@@ -224,6 +268,22 @@ fn function_entity(node: &DartNode<'_>) -> Entity {
   }
 }
 
+/// The definition behind a signature that isn't an entity. Its code is the whole method, body included; a signature with no enclosing method has only itself.
+fn member_definition(node: &DartNode<'_>, kind: &'static str) -> Definition {
+  Definition {
+    kind,
+    name: node
+      .field("name")
+      .map(|n| n.text().to_string())
+      .unwrap_or_else(|| "?".to_string()),
+    line: node.start_pos().line() + 1,
+    full: node
+      .ancestors()
+      .find(|a| a.kind() == "method_declaration")
+      .map_or_else(|| node.text().to_string(), |method| method.text().to_string()),
+  }
+}
+
 fn variable_entity(node: &DartNode<'_>) -> Entity {
   let full = node.text().to_string();
   // The declarator's text starts with the declared name.
@@ -238,6 +298,67 @@ fn variable_entity(node: &DartNode<'_>) -> Entity {
     header: first_line(&full).to_string(),
     full,
   }
+}
+
+/// One instance field of a class, as `attributes` reports it.
+#[derive(Debug)]
+pub struct Attribute {
+  /// The declared type as written (`String`, `int?`, `List<String>`), or `dynamic` when the declaration has none.
+  pub ty: String,
+  pub name: String,
+}
+
+/// The instance fields declared in the body of class `class`, in source order, or None when the file declares no such class. Static fields, getters, setters, methods and constructors are not attributes. A declaration that names several fields (`int? a, b;`) gives one attribute per name.
+///
+/// TODO: add a flag that also lists inherited fields, from the class's `extends` superclass and `with` mixins, resolved through the import graph.
+pub fn attributes(root: &DartRoot, class: &str) -> Option<Vec<Attribute>> {
+  // Finds the class declaration with the requested name.
+  let decl = root
+    .root()
+    .dfs()
+    .find(|n| n.kind() == "class_declaration" && n.field("name").is_some_and(|name| name.text() == class))?;
+  // Holds the fields found so far.
+  let mut found = Vec::new();
+  // A class without a body (`class A = B with C;`) declares no fields.
+  let Some(body) = decl.field("body") else {
+    return Some(found);
+  };
+  // Visits each member of the body; members are wrapped in class_member nodes.
+  for member in body.children().filter(|c| c.kind() == "class_member") {
+    // Field declarations are `declaration` nodes; methods, getters and setters are method_declaration.
+    for declaration in member.children().filter(|c| c.kind() == "declaration") {
+      // Skips static fields, which belong to the class rather than its instances.
+      if declaration.children().any(|c| c.kind() == "static") {
+        continue;
+      }
+      // Finds the list of declared names; constructors and other declarations have none.
+      let Some(list) = declaration
+        .children()
+        .find(|c| matches!(c.kind().as_ref(), "initialized_identifier_list" | "static_final_declaration_list"))
+      else {
+        continue;
+      };
+      // Reads the declared type, which is a direct child of the declaration.
+      let ty = declaration
+        .children()
+        .find(|c| c.kind() == "type")
+        .map_or_else(|| "dynamic".to_string(), |t| t.text().to_string());
+      // Reports each declarator in the list under the shared type.
+      for declarator in list
+        .children()
+        .filter(|c| matches!(c.kind().as_ref(), "initialized_identifier" | "static_final_declaration"))
+      {
+        // The declarator's text starts with the declared name.
+        let text = declarator.text();
+        let name: String = text.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+        found.push(Attribute {
+          ty: ty.clone(),
+          name: if name.is_empty() { "?".to_string() } else { name },
+        });
+      }
+    }
+  }
+  Some(found)
 }
 
 /// The 1-based lines, ascending and without duplicates, where a pattern matches outside the file's directives. Used to find where an importer references an entity by name: a `show Foo` combinator names Foo without using it.
@@ -284,83 +405,4 @@ pub fn find_all(root: &DartRoot, pattern: &Pattern, capture: Option<&str>) -> Ve
       }
     })
     .collect()
-}
-
-#[cfg(test)]
-mod test {
-  use super::*;
-
-  fn facts(src: &str) -> Facts {
-    extract(&parse(src))
-  }
-
-  #[test]
-  fn reads_every_directive_form() {
-    let f = facts(
-      r#"
-import 'package:a/b.dart';
-import "c.dart" as c show X hide Y;
-import 'd.dart' if (dart.library.io) 'e.dart';
-import 'f.dart' deferred as f;
-export 'g.dart' show Z;
-part 'h.dart';
-"#,
-    );
-    assert_eq!(f.imports, ["package:a/b.dart", "c.dart", "d.dart", "e.dart", "f.dart"]);
-    assert_eq!(f.exports, ["g.dart"]);
-    assert_eq!(f.parts, ["h.dart"]);
-  }
-
-  #[test]
-  fn part_of_is_not_a_part() {
-    assert!(facts("part of 'lib.dart';").parts.is_empty());
-  }
-
-  #[test]
-  fn extracts_top_level_entities() {
-    let f = facts(
-      r#"@JsonSerializable()
-class A extends B {}
-enum E { a }
-mixin M on B {}
-extension X on String {}
-typedef F = void Function();
-final fooProvider = 1, bar = 2;
-String? z;
-void main() { var local = 1; }
-class C { void method() {} }
-"#,
-    );
-    let got: Vec<(&str, &str, usize)> = f
-      .entities
-      .iter()
-      .map(|e| (e.kind, e.name.as_str(), e.line))
-      .collect();
-    assert_eq!(
-      got,
-      [
-        ("class", "A", 1),
-        ("enum", "E", 3),
-        ("mixin", "M", 4),
-        ("extension", "X", 5),
-        ("typedef", "F", 6),
-        ("variable", "fooProvider", 7),
-        ("variable", "bar", 7),
-        ("variable", "z", 8),
-        ("function", "main", 9),
-        ("class", "C", 10),
-      ]
-    );
-    assert_eq!(f.entities[0].header, "class A extends B {}");
-  }
-
-  #[test]
-  fn show_combinator_is_not_a_reference() {
-    let root = parse("import 'a.dart' show Foo;\nvoid f() {}\n");
-    let pattern = Pattern::try_new("Foo", Dart).unwrap();
-    assert!(references(&root, &pattern).is_empty());
-    // The use on line 2 is reported; the combinator on line 1 is not.
-    let root = parse("import 'a.dart' show Foo;\nvoid f() { Foo(); }\n");
-    assert_eq!(references(&root, &pattern), vec![2]);
-  }
 }

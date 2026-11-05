@@ -1,6 +1,8 @@
 //! Project plumbing every language shares: finding the root and cache
-//! directory, path conversions, file listing, and DISCOVER_ENTRY.
+//! directory, path conversions, file listing, discover.conf and custom entry points.
 
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -114,17 +116,80 @@ pub fn walk(dir: &Path, skip: &[&str], found: &mut dyn FnMut(&Path, &fs::Metadat
   }
 }
 
-/// DISCOVER_ENTRY="<file> ..." as repo-relative paths, in order and without
-/// repeats; None when unset. Every listed file must exist.
-pub fn entries_from_env(root: &Path) -> Result<Option<Vec<String>>, String> {
-  let Some(list) = env::var("DISCOVER_ENTRY").ok().filter(|v| !v.is_empty()) else {
-    return Ok(None);
+/// What discover.conf sets for one project: just a language, or a language and entry points.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ProjectConfig {
+  /// `"/path/to/project": dart`
+  Lang(String),
+  /// `"/path/to/project": { lang: dart, entries: [lib/main.dart] }`
+  Full { lang: Option<String>, entries: Option<Vec<String>> },
+}
+
+impl ProjectConfig {
+  /// The language this config sets, if any.
+  pub fn lang(&self) -> Option<String> {
+    match self {
+      ProjectConfig::Lang(lang) => Some(lang.clone()),
+      ProjectConfig::Full { lang, .. } => lang.clone(),
+    }
+  }
+
+  /// The entry points this config lists; an empty list counts as none.
+  pub fn entries(&self) -> Option<&[String]> {
+    match self {
+      ProjectConfig::Lang(_) => None,
+      ProjectConfig::Full { entries, .. } => entries.as_deref().filter(|e| !e.is_empty()),
+    }
+  }
+}
+
+/// The config for the current directory, or None when no file sets one. Each discover.conf is a YAML mapping (JSON is valid YAML) of project directory to [`ProjectConfig`]; `./discover.conf` is read before the one in the XDG config directory.
+pub fn project_config() -> Option<ProjectConfig> {
+  // The directory as given and as resolved, so a key written either way matches through a symlink.
+  let raw = env::current_dir().ok()?;
+  let keys = [raw.clone(), fs::canonicalize(&raw).unwrap_or(raw)];
+  // Uses $XDG_CONFIG_HOME as the config directory, falling back to ~/.config.
+  let config_dir = env::var_os("XDG_CONFIG_HOME")
+    .map(PathBuf::from)
+    .or_else(|| env::var_os("HOME").map(|home| Path::new(&home).join(".config")));
+  // Lists the config files in the order they are read.
+  let paths = [Some(PathBuf::from("discover.conf")), config_dir.map(|dir| dir.join("discover.conf"))];
+  // Returns the first config found, going through the paths that could be built.
+  paths.iter().flatten().find_map(|path| {
+    // Reads the file, moving on to the next one when it doesn't exist.
+    let text = fs::read_to_string(path).ok()?;
+    // Parses the file; one holding only comments is an empty mapping.
+    match serde_yaml::from_str::<Option<BTreeMap<String, ProjectConfig>>>(&text) {
+      // Looks up the current directory under either spelling.
+      Ok(projects) => {
+        let mut projects = projects?;
+        keys.iter().find_map(|key| projects.remove(key.to_str()?))
+      }
+      // Warns about a file that isn't valid and moves on.
+      Err(e) => {
+        eprintln!("warning: ignoring {}: {e}", path.display());
+        None
+      }
+    }
+  })
+}
+
+/// Entry points the project chose, which are used instead of the language's defaults: DISCOVER_ENTRY="<file> ..." first, else `entries` in discover.conf. Repo-relative, in order and without repeats; None when neither is set. Every listed file must exist.
+pub fn custom_entries(root: &Path) -> Result<Option<Vec<String>>, String> {
+  // Reads the environment first, because it overrides the config file for one run.
+  let listed: Vec<String> = match env::var("DISCOVER_ENTRY").ok().filter(|v| !v.is_empty()) {
+    Some(list) => list.split_whitespace().map(str::to_string).collect(),
+    None => match project_config().as_ref().and_then(ProjectConfig::entries) {
+      Some(entries) => entries.to_vec(),
+      None => return Ok(None),
+    },
   };
   let mut entries: Vec<String> = Vec::new();
-  for word in list.split_whitespace() {
+  for word in &listed {
     let abs = to_abs(root, word);
     if !abs.is_file() {
-      return Err(format!("DISCOVER_ENTRY file not found: {word}"));
+      return Err(format!("entry point not found: {word}"));
     }
     let rel = fs::canonicalize(&abs).map(|p| relative(root, &p)).unwrap_or_default();
     if !rel.is_empty() && !entries.contains(&rel) {
@@ -150,18 +215,5 @@ pub fn relative(base: &Path, path: &Path) -> String {
     ".".to_string()
   } else {
     out.to_string_lossy().into_owned()
-  }
-}
-
-#[cfg(test)]
-mod test {
-  use super::*;
-
-  #[test]
-  fn relative_paths() {
-    let base = Path::new("/a/b");
-    assert_eq!(relative(base, Path::new("/a/b/lib/x.dart")), "lib/x.dart");
-    assert_eq!(relative(base, Path::new("/a/c/x.dart")), "../c/x.dart");
-    assert_eq!(relative(base, Path::new("/a/b")), ".");
   }
 }

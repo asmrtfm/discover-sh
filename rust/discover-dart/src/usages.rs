@@ -1,16 +1,20 @@
 //! `usages`: structural search over lib/ with an ast-grep pattern, and the
 //! `--assets` lookup of what references an asset path.
 
-use crate::dart::{self, Hit};
+use crate::common::project_facts;
+use crate::dart::{self, Facts, Hit};
 use crate::graph::Graph;
 use ast_grep_core::Pattern;
 use ast_grep_language::Dart;
+use discover_core::cli::VERBOSE;
 use discover_core::par::par_map;
 use discover_core::usages::{Usage, file_line, sorted_unique};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// The files `ast-grep run -l dart <pattern> lib/` searches: every *.dart
 /// under lib/ (generated files included), skipping hidden and gitignored
@@ -60,13 +64,29 @@ fn format(hits: impl IntoIterator<Item = (String, Hit)>) -> Vec<Usage> {
   sorted_unique(rows, file_line)
 }
 
-/// `usages <pattern> [--live-only]`. An invalid pattern finds nothing, as
-/// it did when ast-grep's error was discarded.
+/// Removes the hits at the file and line where `definition` finds `symbol`. Variables are not definitions, so they stay.
+fn drop_definitions(hits: &mut Vec<(String, Hit)>, files: &[(String, Arc<Facts>)], symbol: &str) {
+  let definitions: HashSet<(&str, usize)> = files
+    .iter()
+    .flat_map(|(rel, facts)| {
+      let named = facts.definitions.iter().filter(|d| d.name == symbol && d.kind != "variable");
+      named.map(move |e| (rel.as_str(), e.line))
+    })
+    .collect();
+  hits.retain(|(file, hit)| !definitions.contains(&(file.as_str(), hit.line)));
+}
+
+/// `usages <pattern> [--live-only] [-v|--verbose]`. An invalid pattern finds nothing, as
+/// it did when ast-grep's error was discarded. Unless verbose, the symbol's own definitions are left out; variables are not definitions, so they stay.
 pub fn pattern_usages(graph: &Graph, pattern: &str, live_only: bool) -> Result<Vec<Usage>, String> {
+  let symbol = pattern;
   let Ok(pattern) = Pattern::try_new(pattern, Dart) else {
     return Ok(Vec::new());
   };
-  let hits = search(graph, &pattern, None);
+  let mut hits = search(graph, &pattern, None);
+  if !VERBOSE.load(Ordering::Relaxed) {
+    drop_definitions(&mut hits, &project_facts(graph), symbol);
+  }
   if !live_only {
     return Ok(format(hits));
   }

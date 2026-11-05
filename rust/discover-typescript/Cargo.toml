@@ -9,10 +9,6 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[[bin]]
-name = "discover-typescript"
-path = "src/main.rs"
-
 [dependencies]
 # Parsing and pattern matching run in-process with ast-grep's TypeScript/TSX support.
 ast-grep-core = { workspace = true, features = ["tree-sitter"] }

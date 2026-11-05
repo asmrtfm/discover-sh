@@ -14,45 +14,32 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::process::ExitCode;
 
-fn usage<J: Jvm>() -> String {
-  let name = J::NAME;
-  format!(
-    "usage: {name} [--rebuild-cache] <command> [args]
-
-global flags:
-  --rebuild-cache                        Wipe and rebuild all caches before running command
-
-environment:
-  DISCOVER_ENTRY=\"<file> ...\"            Entry point(s), overriding main/manifest/services detection
-
-commands:
-  resolve <import> [--from <file>]       Resolve an import (or, with --from, a name) to file(s)
+/// The help text for the commands implemented in this crate, which core prints after its shared help.
+pub const USAGE: &str = "  resolve <import> [--from <file>]       Resolve an import (or, with --from, a name) to file(s)
   inspect <file> [--package] [--imports] [--entities]
            [--depth names|signatures|full]
   definition <file> <symbol>             Find where a symbol used in <file> is defined
-  live-files                             List all files reachable from the entry points
-  dead-files [--rebuild]                 List all dead files (verified by recursive trace)
-  is-live <file>                         Check if a file is reachable from the entry points
-  importers <file>                       Find all files that depend on <file>
-  trace <file>                           Trace usage and liveness of a file's dependency chain
-  prune <file>                           Remove a file entry from caches without rebuilding
   usages <pattern> [--live-only]         Find all references to an ast-grep pattern
-  usages --assets <asset-path>           Check if an asset is referenced in live code"
-  )
-}
+  usages --assets <asset-path>           Check if an asset is referenced in live code
+
+environment:
+  DISCOVER_ENTRY=\"<file> ...\"            Entry point(s), overriding discover.conf and the defaults";
 
 /// Runs the navigator for language `J`.
 pub fn main<J: Jvm>() -> ExitCode {
   // The index underlies every lookup, entry detection included, so it is
   // brought up to date (or rebuilt for --rebuild-cache) before anything else.
   cli::main(
-    &usage::<J>(),
+    // Passes this crate's help text, which core prints after its shared help.
+    USAGE,
     |rebuild| graph::open(Project::<J>::discover()?, rebuild),
     |graph, command, args| match command {
       "resolve" => cmd_resolve(graph, args),
       "inspect" => cmd_inspect(graph, args),
       "definition" => cmd_definition(graph, args),
       "usages" => cmd_usages(graph, args),
+      // attributes is Dart only for now: no output, exit 1.
+      "attributes" => Ok(1),
       _ => unreachable!("checked against COMMANDS"),
     },
   )
@@ -98,8 +85,8 @@ fn cmd_inspect<J: Jvm>(graph: &Graph<J>, args: &[String]) -> Result<u8, String> 
   let (entities_on, depth) = (parsed.entities, parsed.depth.as_str());
   let (path, rel) = file_arg(&graph.project.root, file)?;
 
-  // --entities name: plain text, one name per line, no JSON wrapper.
-  if entities_on && depth == "name" {
+  // --depth names: plain text, one name per line, no JSON wrapper.
+  if entities_on && depth == "names" {
     decls::<J>(&path).iter().for_each(|d| out(&d.name));
     return Ok(0);
   }

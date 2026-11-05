@@ -9,7 +9,7 @@ use crate::{Decl, Jvm, parse};
 use discover_core::cache::{self, Caches, Slot, read_lines, to_json};
 use discover_core::graph::{Importers, Lang, Row};
 use discover_core::par::par_map;
-use discover_core::project::entries_from_env;
+use discover_core::project::custom_entries;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -77,17 +77,17 @@ impl<J: Jvm> JvmLang<J> {
   }
 
   // ─────────────────────────────────────────────────────────
-  // entry points — DISCOVER_ENTRY (repo-relative files)
-  // overrides everything; otherwise every root the runtime
+  // entry points — DISCOVER_ENTRY or `entries` in discover.conf
+  // (repo-relative files) replace the defaults; otherwise every root the runtime
   // itself starts from: files declaring a `main`, Android
   // manifest components (instantiated by the OS by name) and
   // META-INF/services providers (instantiated by ServiceLoader).
   // Classes reached only through reflection or DI annotation
-  // scanning can't be seen — list them in DISCOVER_ENTRY.
+  // scanning can't be seen — list them in discover.conf.
   // ─────────────────────────────────────────────────────────
 
   fn detect_entries(&mut self) -> Result<(), String> {
-    if let Some(listed) = entries_from_env(&self.project.root)? {
+    if let Some(listed) = custom_entries(&self.project.root)? {
       self.entry_set = listed.iter().cloned().collect();
       self.entries = listed;
       return Ok(());
@@ -113,7 +113,7 @@ impl<J: Jvm> JvmLang<J> {
 
   fn require_entries(&self) -> Result<(), String> {
     if self.entries.is_empty() {
-      return Err("no entry point found (set DISCOVER_ENTRY to the repo-relative entry file(s))".into());
+      return Err("no entry point found (list them under entries in discover.conf, see: discover config)".into());
     }
     Ok(())
   }

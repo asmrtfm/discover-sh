@@ -11,37 +11,32 @@
 //!   live-files
 //!   dead-files [--rebuild]
 //!   is-live <file>
-//!   importers <file>
-//!   trace <file>
-//!   prune <file>
-//!   usages <pattern> [--live-only]
+//!   importers [--strict] <files ...>
+//!   trace [--strict] <files ...>
+//!   prune [--strict] <files ...>
+//!   usages <pattern> [--live-only] [-v|--verbose]
 //!   usages --assets <asset-path>
+//!   attributes <class> <file>
 
-mod dart;
+mod common;
+pub mod dart;
 mod graph;
 mod project;
 mod usages;
 
-use dart::{Directive, Facts};
+use dart::Directive;
 use discover_core::cli::{
   self, DefinitionArgs, DefinitionOut, EntityOut, UsagesArgs, file_arg, out, out_definition, out_json,
   out_pretty_definition, parse_definition, parse_inspect, parse_resolve, parse_usages,
 };
 use graph::{DartLang, Graph};
-use project::{Project, generated_extensions};
+use project::Project;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 
-const USAGE: &str = "usage: discover-dart [--rebuild-cache] <command> [args]
-
-global flags:
-  --rebuild-cache                        Wipe and rebuild all caches before running command
-
-commands:
-  resolve <uri> [--from <file>]          Resolve import URI to repo-relative path
+const USAGE: &str = "  resolve <uri> [--from <file>]          Resolve import URI to repo-relative path
   inspect <file> [--imports] [--exports] [--parts] [--entities]
            [--depth names|signatures|full]
   definition <symbol> [<file>] [-v|--verbose] [-p|--pretty]
@@ -49,22 +44,36 @@ commands:
                                          without <file>, every definition in the project
                                          (--verbose adds each definition's code;
                                          --pretty prints the code as written, not JSON)
-  live-files                             List all files reachable from main.dart
-  dead-files [--rebuild]                 List all dead files (verified by recursive trace)
-  is-live <file>                         Check if a file is reachable from main.dart
-  importers <file>                       Find all files that import/export <file>
-  trace <file>                           Trace usage and liveness of a file's import chain
-  prune <file>                           Remove a file entry from caches without rebuilding
-  usages <pattern> [--live-only]         Find all references to an ast-grep pattern
+  usages <pattern> [--live-only] [-v|--verbose]
+                                         Find all references to an ast-grep pattern
+                                         (--verbose keeps the symbol's own definition)
   usages --assets <asset-path>           Check if an asset is referenced in live code";
 
-fn main() -> ExitCode {
-  cli::main(USAGE, |_| Ok(graph::open(Project::discover()?)), |graph, command, args| {
+/// How the discover binary identifies and runs Dart.
+pub const LANGUAGE: cli::Language = cli::Language {
+  // Selects Dart with --lang=dart.
+  name: "dart",
+  // Identifies Dart source files.
+  extensions: &["dart"],
+  // Identifies a Dart project.
+  manifests: &["pubspec.yaml"],
+  // Describes the default entry points in generated config files.
+  entry_defaults: "lib/main.dart",
+  // Runs the function below.
+  main,
+  // Lists the Dart commands for --help.
+  usage: USAGE,
+};
+
+/// Runs the Dart navigator.
+pub fn main() -> ExitCode {
+  cli::main(USAGE, |_| graph::open(Project::discover()?), |graph, command, args| {
     match command {
       "resolve" => cmd_resolve(graph, args),
       "inspect" => cmd_inspect(graph, args),
       "definition" => cmd_definition(graph, args),
       "usages" => cmd_usages(graph, args),
+      "attributes" => cmd_attributes(graph, args),
       _ => unreachable!("checked against COMMANDS"),
     }
   })
@@ -77,6 +86,32 @@ fn cmd_resolve(graph: &Graph, args: &[String]) -> Result<u8, String> {
   let (uri, from) = parse_resolve::<DartLang>(args, "<uri>")?;
   if let Some(resolved) = graph.project.resolve_uri(uri, from) {
     out(&resolved);
+  }
+  Ok(0)
+}
+
+// ─────────────────────────────────────────────────────────
+// attributes — the instance fields of a class: one name per
+// line, or with --verbose a JSON array of { <name>: <type> }
+// ─────────────────────────────────────────────────────────
+fn cmd_attributes(graph: &Graph, args: &[String]) -> Result<u8, String> {
+  // Takes the class name and the file that defines it.
+  let [class, file] = args else {
+    return Err("usage: discover --lang=dart attributes <class> <file>".into());
+  };
+  let (path, _) = file_arg(&graph.project.root, file)?;
+  // Parses the one file; the cached facts don't keep class members.
+  let src = std::fs::read_to_string(&path).map_err(|e| format!("{file}: {e}"))?;
+  let root = dart::parse(&src);
+  let attributes = dart::attributes(&root, class).ok_or_else(|| format!("class {class} not found in {file}"))?;
+  if cli::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+    // One single-key object per field, name to type, in source order.
+    let typed: Vec<std::collections::BTreeMap<&str, &str>> =
+      attributes.iter().map(|a| std::collections::BTreeMap::from([(a.name.as_str(), a.ty.as_str())])).collect();
+    out_json(&typed);
+  } else {
+    // Plain text, one name per line.
+    attributes.iter().for_each(|a| out(&a.name));
   }
   Ok(0)
 }
@@ -116,8 +151,8 @@ fn cmd_inspect(graph: &Graph, args: &[String]) -> Result<u8, String> {
   let (path, rel) = file_arg(&graph.project.root, file)?;
   let facts = graph.facts(&path);
 
-  // --entities name: plain text, one name per line, no JSON wrapper.
-  if entities && depth == "name" {
+  // --depth names: plain text, one name per line, no JSON wrapper.
+  if entities && depth == "names" {
     facts.entities.iter().for_each(|e| out(&e.name));
     return Ok(0);
   }
@@ -161,7 +196,7 @@ fn cmd_definition(graph: &Graph, args: &[String]) -> Result<u8, String> {
   let (path, rel) = file_arg(&graph.project.root, file)?;
   let facts = graph.facts(&path);
 
-  if let Some(e) = facts.entity(symbol) {
+  if let Some(e) = facts.definition(symbol) {
     let def = DefinitionOut {
       symbol,
       kind: e.kind,
@@ -196,22 +231,12 @@ fn cmd_definition(graph: &Graph, args: &[String]) -> Result<u8, String> {
 /// Every declaration of `symbol` in the project's source files and their
 /// generated extensions (`*.g.dart`, `*.freezed.dart`), in file order.
 fn all_definitions(graph: &Graph, symbol: &str, verbose: bool, pretty: bool) -> Result<u8, String> {
-  let files: Vec<(String, Arc<Facts>)> = graph
-    .project
-    .relevant_files()
-    .into_iter()
-    .flat_map(|base| {
-      let mut files = vec![base.clone()];
-      files.extend(generated_extensions(&base));
-      files
-    })
-    .map(|path| (graph.project.rel(&path), graph.facts(&path)))
-    .collect();
+  let files = common::project_facts(graph);
 
   let found: Vec<DefinitionOut> = files
     .iter()
     .flat_map(|(rel, facts)| {
-      facts.entities.iter().filter(|e| e.name == symbol).map(move |e| DefinitionOut {
+      facts.definitions.iter().filter(|e| e.name == symbol).map(move |e| DefinitionOut {
         symbol,
         kind: e.kind,
         file: rel,
@@ -256,7 +281,7 @@ fn search_definition(
   }
   let rel = graph.project.rel(&path);
   let facts = graph.facts(&path);
-  if let Some(e) = facts.entity(symbol) {
+  if let Some(e) = facts.definition(symbol) {
     let def = DefinitionOut {
       symbol,
       kind: e.kind,

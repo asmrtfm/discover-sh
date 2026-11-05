@@ -1,13 +1,12 @@
 //! The project being navigated: root, source files, and the files that
 //! declare framework entry points. Nothing project-specific is hardcoded:
 //!   source files — the language's sources the project hasn't gitignored (tests and buildSrc excluded)
-//!   entry points — $DISCOVER_ENTRY, else every `main` function, Android
+//!   entry points — $DISCOVER_ENTRY or `entries` in discover.conf, else every `main` function, Android
 //!                  manifest components and META-INF/services providers
 
 use crate::Jvm;
 use discover_core::cache::Fnv;
-use discover_core::project::{self, relative};
-use std::env;
+use discover_core::project::{self, custom_entries, relative};
 use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -175,7 +174,7 @@ impl<J: Jvm> Project<J> {
   /// Fingerprint of everything the graph is built from: every source file's
   /// mtime and size (a file's dependencies change when ANY file in its
   /// package gains or loses a declaration), the entry-point declarations,
-  /// and DISCOVER_ENTRY.
+  /// and any custom entry points.
   pub fn fingerprint(&self) -> String {
     let mut hash = Fnv::default();
     let files = self
@@ -193,14 +192,14 @@ impl<J: Jvm> Project<J> {
         hash.feed(format!("{mtime} {} {file}", meta.len()).as_bytes());
       }
     }
-    hash.feed(env::var("DISCOVER_ENTRY").unwrap_or_default().as_bytes());
+    hash.feed(custom_entries(&self.root).ok().flatten().unwrap_or_default().join("\n").as_bytes());
     hash.hex()
   }
 }
 
 /// A file under a test source set (a directory `src/<…[Tt]est…>/`) or
 /// under `buildSrc/`. Only directories count, not the file name itself.
-fn is_test_or_build_logic(rel: &str) -> bool {
+pub fn is_test_or_build_logic(rel: &str) -> bool {
   let segments: Vec<&str> = rel.split('/').collect();
   let dirs = &segments[..segments.len().saturating_sub(1)];
   let test_source_set = dirs
@@ -210,7 +209,7 @@ fn is_test_or_build_logic(rel: &str) -> bool {
 }
 
 /// The XML with comments removed, so commented-out components don't count.
-fn strip_xml_comments(xml: &str) -> String {
+pub fn strip_xml_comments(xml: &str) -> String {
   let mut out = String::with_capacity(xml.len());
   let mut rest = xml;
   while let Some(start) = rest.find("<!--") {
@@ -225,11 +224,11 @@ fn strip_xml_comments(xml: &str) -> String {
 }
 
 /// Opening tags (`<name …`, up to `>`) for any of the given element names.
-fn tags(xml: &str, names: &[&str]) -> Vec<String> {
+pub fn tags(xml: &str, names: &[&str]) -> Vec<String> {
   names.iter().flat_map(|n| tags_named(xml, n)).collect()
 }
 
-fn tags_named(xml: &str, name: &str) -> Vec<String> {
+pub fn tags_named(xml: &str, name: &str) -> Vec<String> {
   let open = format!("<{name}");
   let mut found = Vec::new();
   let mut rest = xml;
@@ -246,7 +245,7 @@ fn tags_named(xml: &str, name: &str) -> Vec<String> {
 }
 
 /// The value of `attr="…"` in a tag's attribute text.
-fn attribute(tag: &str, attr: &str) -> Option<String> {
+pub fn attribute(tag: &str, attr: &str) -> Option<String> {
   let key = format!("{attr}=\"");
   let mut rest = tag;
   while let Some(i) = rest.find(&key) {
@@ -258,38 +257,4 @@ fn attribute(tag: &str, attr: &str) -> Option<String> {
     rest = value;
   }
   None
-}
-
-#[cfg(test)]
-mod test {
-  use super::*;
-
-  #[test]
-  fn excludes_tests_and_build_logic() {
-    assert!(is_test_or_build_logic("app/src/test/java/A.java"));
-    assert!(is_test_or_build_logic("app/src/androidTest/java/A.kt"));
-    assert!(is_test_or_build_logic("buildSrc/src/main/kotlin/A.kt"));
-    assert!(!is_test_or_build_logic("app/src/main/java/com/x/testutil/A.java"));
-    assert!(!is_test_or_build_logic("app/src/main/java/A.kt"));
-  }
-
-  #[test]
-  fn reads_manifest_tags() {
-    let xml = strip_xml_comments(
-      r#"<manifest package="com.x">
-  <!-- <activity android:name=".Old" /> -->
-  <application
-    android:name=".App">
-    <activity android:name="Main" />
-    <activity-alias android:name="com.y.Alias" />
-  </application>
-</manifest>"#,
-    );
-    let names: Vec<String> = tags(&xml, &["application", "activity", "activity-alias"])
-      .iter()
-      .filter_map(|t| attribute(t, "android:name"))
-      .collect();
-    assert_eq!(names, [".App", "Main", "com.y.Alias"]);
-    assert_eq!(attribute(&tags_named(&xml, "manifest")[0], "package").as_deref(), Some("com.x"));
-  }
 }

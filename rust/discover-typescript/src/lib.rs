@@ -1,4 +1,4 @@
-//! discover-typescript — deterministic TypeScript codebase navigation,
+//! discover-typescript — deterministic TypeScript and JavaScript codebase navigation,
 //! in-process on ast-grep's TypeScript/TSX support. A port of the
 //! TypeScript discover.sh: same subcommands, flags, JSON shapes and stderr
 //! commentary, with each file parsed once instead of once per query. The
@@ -12,15 +12,16 @@
 //!   live-files
 //!   dead-files [--rebuild]
 //!   is-live <file>
-//!   importers <file>
-//!   trace <file>
-//!   prune <file>
+//!   importers [--strict] <files ...>
+//!   trace [--strict] <files ...>
+//!   prune [--strict] <files ...>
 //!   usages <pattern> [--live-only]
 //!   usages --assets <asset-path>
+//!   attributes <class> <file>
 
 mod graph;
-mod project;
-mod ts;
+pub mod project;
+pub mod ts;
 mod usages;
 
 use discover_core::cli::{
@@ -34,35 +35,41 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use ts::{Directive, is_script};
 
-const USAGE: &str = "usage: discover-typescript [--rebuild-cache] <command> [args]
-
-global flags:
-  --rebuild-cache                        Wipe and rebuild all caches before running command
-
-environment:
-  DISCOVER_ENTRY=\"<file> ...\"            Entry point(s), overriding package.json / index detection
-
-commands:
-  resolve <specifier> [--from <file>]    Resolve import specifier to repo-relative path
+const USAGE: &str = "  resolve <specifier> [--from <file>]    Resolve import specifier to repo-relative path
   inspect <file> [--imports] [--exports] [--dynamic] [--entities]
            [--depth names|signatures|full]
   definition <file> <symbol>             Find where a symbol used in <file> is defined
-  live-files                             List all files reachable from the entry points
-  dead-files [--rebuild]                 List all dead files (verified by recursive trace)
-  is-live <file>                         Check if a file is reachable from the entry points
-  importers <file>                       Find all files that import/export/load <file>
-  trace <file>                           Trace usage and liveness of a file's import chain
-  prune <file>                           Remove a file entry from caches without rebuilding
   usages <pattern> [--live-only]         Find all references to an ast-grep pattern
-  usages --assets <asset-path>           Check if an asset is referenced in live code";
+  usages --assets <asset-path>           Check if an asset is referenced in live code
 
-fn main() -> ExitCode {
+environment:
+  DISCOVER_ENTRY=\"<file> ...\"            Entry point(s), overriding discover.conf and the defaults";
+
+/// How the discover binary identifies and runs TypeScript.
+pub const LANGUAGE: cli::Language = cli::Language {
+  // Selects TypeScript with --lang=typescript.
+  name: "typescript",
+  // Identifies TypeScript and JavaScript source files.
+  extensions: &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
+  // Identifies a TypeScript or JavaScript project.
+  manifests: &["package.json"],
+  // Describes the default entry points in generated config files.
+  entry_defaults: "package.json source/module/main/bin, node commands in package.json scripts, Dockerfile CMD/ENTRYPOINT and docker-compose command, else the first of index, server, app, main at the root or in src/",
+  // Runs the function below.
+  main,
+  // Lists the TypeScript commands for --help.
+  usage: USAGE,
+};
+
+/// Runs the TypeScript navigator.
+pub fn main() -> ExitCode {
   cli::main(USAGE, |_| Ok(graph::open(Project::discover()?)), |graph, command, args| {
     match command {
       "resolve" => cmd_resolve(graph, args),
       "inspect" => cmd_inspect(graph, args),
       "definition" => cmd_definition(graph, args),
       "usages" => cmd_usages(graph, args),
+      "attributes" => cmd_attributes(graph, args),
       _ => unreachable!("checked against COMMANDS"),
     }
   })
@@ -75,6 +82,33 @@ fn cmd_resolve(graph: &Graph, args: &[String]) -> Result<u8, String> {
   let (uri, from) = parse_resolve::<TsLang>(args, "<specifier>")?;
   if let Some(resolved) = graph.project.resolve_uri(uri, from) {
     out(&resolved);
+  }
+  Ok(0)
+}
+
+// ─────────────────────────────────────────────────────────
+// attributes — the instance fields of a class, or the schema
+// fields of a Mongoose model: one name per line, or with
+// --verbose a JSON array of { <name>: <type> }
+// ─────────────────────────────────────────────────────────
+fn cmd_attributes(graph: &Graph, args: &[String]) -> Result<u8, String> {
+  // Takes the class (or model) name and the file that defines it.
+  let [class, file] = args else {
+    return Err("usage: discover --lang=typescript attributes <class> <file>".into());
+  };
+  let (path, _) = file_arg(&graph.project.root, file)?;
+  // Parses the one file; the cached facts don't keep class members or schemas.
+  let src = std::fs::read_to_string(&path).map_err(|e| format!("{file}: {e}"))?;
+  let root = ts::parse(&src, ts::lang_for(&path));
+  let attributes = ts::attributes(&root, class).ok_or_else(|| format!("class or model {class} not found in {file}"))?;
+  if cli::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+    // One single-key object per field, name to type, in source order.
+    let typed: Vec<std::collections::BTreeMap<&str, &str>> =
+      attributes.iter().map(|a| std::collections::BTreeMap::from([(a.name.as_str(), a.ty.as_str())])).collect();
+    out_json(&typed);
+  } else {
+    // Plain text, one name per line.
+    attributes.iter().for_each(|a| out(&a.name));
   }
   Ok(0)
 }
@@ -117,8 +151,8 @@ fn cmd_inspect(graph: &Graph, args: &[String]) -> Result<u8, String> {
   }
   let facts = graph.facts(&path);
 
-  // --entities name: plain text, one name per line, no JSON wrapper.
-  if entities && depth == "name" {
+  // --depth names: plain text, one name per line, no JSON wrapper.
+  if entities && depth == "names" {
     facts.entities.iter().for_each(|e| out(&e.name));
     return Ok(0);
   }

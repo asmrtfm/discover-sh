@@ -41,7 +41,7 @@ pub type Importers = BTreeMap<String, Vec<Row>>;
 
 /// What a language contributes to the graph.
 pub trait Lang {
-  /// The binary's name, used in usage messages (e.g. `discover-dart`).
+  /// The command that runs this language, used in usage messages (e.g. `discover --lang=dart`).
   const NAME: &'static str;
 
   /// Canonical project root.
@@ -183,6 +183,22 @@ impl<L: Lang> Graph<L> {
     self.build_dead()?;
     eprintln!("Done.");
     Ok(())
+  }
+
+  /// Every file the live list, dead list or importers index mentions, read from disk as they are: deleting a file changes the fingerprint, so the checked accessors would rebuild the very caches prune is about to patch.
+  pub fn cached_files(&self) -> HashSet<String> {
+    let mut files: HashSet<String> = crate::cache::read_lines(self.live.path()).into_iter().collect();
+    files.extend(crate::cache::read_lines(self.dead.path()));
+    if let Some(index) = std::fs::read_to_string(self.importers.path())
+      .ok()
+      .and_then(|t| serde_json::from_str::<Importers>(&t).ok())
+    {
+      for (target, rows) in index {
+        files.insert(target);
+        files.extend(rows.into_iter().map(|r| r.file));
+      }
+    }
+    files
   }
 
   /// prune: drop one file from the live list and the importers index (as a

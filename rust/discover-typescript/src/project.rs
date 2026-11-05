@@ -1,11 +1,9 @@
 //! The project being navigated: root, source files, tsconfig path aliases,
 //! module resolution and entry points. Nothing project-specific is
 //! hardcoded; it is all read from the project:
-//!   source files — *.ts *.tsx *.mts *.cts the project hasn't gitignored
-//!                  (declaration files and tests excluded)
+//!   source files — TypeScript and JavaScript modules the project hasn't gitignored (declaration files and tests excluded)
 //!   path aliases — tsconfig.json compilerOptions.paths / baseUrl, following `extends`
-//!   entry points — $DISCOVER_ENTRY, else package.json source/module/main,
-//!                  else the conventional index/main module at the root or in src/
+//!   entry points — $DISCOVER_ENTRY or `entries` in discover.conf, else what package.json and the docker files start, else the conventional index/server/app/main module at the root or in src/
 
 use crate::ts::is_script;
 use discover_core::project::{self, relative};
@@ -65,12 +63,12 @@ impl Project {
     project::existing(&self.root, rel)
   }
 
-  /// Repo-relative TypeScript sources: git's view when available, so
+  /// Repo-relative TypeScript and JavaScript sources: git's view when available, so
   /// node_modules, build output and anything else the project ignores never
   /// enters the graph; otherwise a walk that at least skips installed packages.
   fn source_listing(&self) -> Vec<String> {
-    const EXTS: [&str; 4] = [".ts", ".tsx", ".mts", ".cts"];
-    if let Some(files) = project::git_listing(&self.root, &["*.ts", "*.tsx", "*.mts", "*.cts"]) {
+    const EXTS: [&str; 8] = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
+    if let Some(files) = project::git_listing(&self.root, &["*.ts", "*.tsx", "*.mts", "*.cts", "*.js", "*.jsx", "*.mjs", "*.cjs"]) {
       return files;
     }
     let mut found = Vec::new();
@@ -99,10 +97,7 @@ impl Project {
       .collect()
   }
 
-  /// Files whose imports form the graph: the sources plus the entry points,
-  /// which may be plain JavaScript (e.g. a React Native index.js). Without
-  /// them their edges would be missing from the importers index and
-  /// everything below them would trace as dead.
+  /// Files whose imports form the graph: the sources plus the entry points, which may be excluded from the sources (e.g. an entry under a test directory). Without them their edges would be missing from the importers index and everything below them would trace as dead.
   pub fn graph_files(&self) -> Vec<PathBuf> {
     let mut files = self.relevant_files();
     files.extend(self.entries.iter().filter_map(|e| self.existing(e)));
@@ -209,42 +204,40 @@ impl Project {
     }
   }
 
+  /// Adds a path the project starts from, unless it isn't a source file the project keeps (`main` often points at build output).
+  fn add_started(&mut self, target: &str, git: bool) {
+    let Some(rel) = self.resolve_module_path(&self.root.join(target).to_string_lossy()) else {
+      return;
+    };
+    if is_script(&rel) && !is_excluded(&rel) && !(git && self.git_ignored(&rel)) {
+      self.add_entry(rel);
+    }
+  }
+
   /// Entry points, in order of precedence:
-  ///   DISCOVER_ENTRY="src/server.ts src/worker.ts" (repo-relative)
-  ///   package.json source/module/main, only when it names a source file the
-  ///     project hasn't ignored (`main` often points at build output)
-  ///   the first of index / src/index / src/main / main that exists
+  ///   custom entries (DISCOVER_ENTRY or discover.conf), used instead of everything below
+  ///   everything the project starts: package.json source/module/main/bin, the files package.json scripts run, Dockerfile CMD/ENTRYPOINT and docker-compose command
+  ///   otherwise the first of index / server / app / main, at the root or in src/, that exists
   fn detect_entries(&mut self) -> Result<(), String> {
-    if let Some(listed) = project::entries_from_env(&self.root)? {
+    if let Some(listed) = project::custom_entries(&self.root)? {
       listed.into_iter().for_each(|rel| self.add_entry(rel));
       return Ok(());
     }
 
-    let fields: Vec<String> = fs::read_to_string(self.root.join("package.json"))
-      .ok()
-      .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-      .map(|pkg| {
-        ["source", "module", "main"]
-          .iter()
-          .filter_map(|k| pkg.get(k).and_then(Value::as_str).map(str::to_string))
-          .collect()
-      })
-      .unwrap_or_default();
     let git = project::in_git(&self.root);
-    for field in fields {
-      let Some(rel) = self.resolve_module_path(&self.root.join(&field).to_string_lossy()) else {
-        continue;
-      };
-      if !is_script(&rel) || (git && self.git_ignored(&rel)) {
-        continue;
-      }
-      self.add_entry(rel);
+    let pkg = fs::read_to_string(self.root.join("package.json"))
+      .ok()
+      .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    let mut started: Vec<String> = pkg.as_ref().map(package_targets).unwrap_or_default();
+    started.extend(docker_targets(&self.root));
+    for target in started {
+      self.add_started(&target, git);
     }
     if !self.entries.is_empty() {
       return Ok(());
     }
 
-    for base in ["index", "src/index", "src/main", "main"] {
+    for base in ["index", "src/index", "server", "src/server", "app", "src/app", "src/main", "main"] {
       if let Some(rel) = self.resolve_module_path(&self.root.join(base).to_string_lossy()) {
         if is_script(&rel) {
           self.add_entry(rel);
@@ -265,12 +258,74 @@ impl Project {
   }
 }
 
-/// Declaration files and tests (*.test.*, *.spec.*, __tests__/, __mocks__/).
-fn is_excluded(rel: &str) -> bool {
+/// The files package.json says start the project: source/module/main, bin (a path or a map of command to path) and what its scripts run.
+pub fn package_targets(pkg: &Value) -> Vec<String> {
+  let mut targets: Vec<String> = ["source", "module", "main"]
+    .iter()
+    .filter_map(|k| pkg.get(k)?.as_str().map(str::to_string))
+    .collect();
+  match pkg.get("bin") {
+    Some(Value::String(path)) => targets.push(path.clone()),
+    Some(Value::Object(paths)) => targets.extend(paths.values().filter_map(Value::as_str).map(str::to_string)),
+    _ => {}
+  }
+  let scripts = pkg.get("scripts").and_then(Value::as_object);
+  for command in scripts.into_iter().flat_map(|s| s.values()).filter_map(Value::as_str) {
+    targets.extend(runner_targets(command).into_iter().map(str::to_string));
+  }
+  targets
+}
+
+/// The file arguments of JS runtimes in a shell command. A word starting with `-` is a flag, not a file.
+pub fn runner_targets(command: &str) -> Vec<&str> {
+  let words: Vec<&str> = command.split_whitespace().collect();
+  words
+    .windows(2)
+    .filter(|pair| matches!(pair[0], "node" | "nodemon" | "ts-node" | "tsx" | "bun") && !pair[1].starts_with('-'))
+    .map(|pair| pair[1].trim_matches(['"', '\'', ';']))
+    .collect()
+}
+
+/// Whether a file at the project root is a Dockerfile or a compose file.
+pub fn is_docker_file(name: &str) -> bool {
+  let compose = (name.starts_with("docker-compose") || name.starts_with("compose")) && (name.ends_with(".yml") || name.ends_with(".yaml"));
+  compose || name == "Dockerfile" || name.starts_with("Dockerfile.") || name.ends_with(".Dockerfile")
+}
+
+/// What one Dockerfile or compose file line runs, with the exec-form and quoting characters blanked so `["node", "x.js"]` and `sh -c "node x.js"` read as plain words. None for any other line.
+pub fn docker_command(line: &str) -> Option<String> {
+  let line = line.trim();
+  let lower = line.to_ascii_lowercase();
+  let prefix = ["cmd ", "entrypoint ", "command:", "entrypoint:"].iter().find(|p| lower.starts_with(**p))?;
+  Some(line[prefix.len()..].replace(['[', ']', ',', '"', '\''], " "))
+}
+
+/// The files the docker files at the project root run.
+fn docker_targets(root: &Path) -> Vec<String> {
+  let mut files: Vec<PathBuf> = fs::read_dir(root)
+    .into_iter()
+    .flatten()
+    .flatten()
+    .filter(|e| is_docker_file(&e.file_name().to_string_lossy()))
+    .map(|e| e.path())
+    .collect();
+  // Sorted because directory order varies and entries feed the fingerprint.
+  files.sort();
+  let mut targets = Vec::new();
+  for text in files.iter().filter_map(|f| fs::read_to_string(f).ok()) {
+    for command in text.lines().filter_map(docker_command) {
+      targets.extend(runner_targets(&command).into_iter().map(str::to_string));
+    }
+  }
+  targets
+}
+
+/// Declaration files and tests (*.test.*, *.spec.*, __tests__/, __mocks__/, test/, tests/).
+pub fn is_excluded(rel: &str) -> bool {
   [".d.ts", ".d.mts", ".d.cts"].iter().any(|e| rel.ends_with(e))
     || rel.contains(".test.")
     || rel.contains(".spec.")
-    || ["__tests__/", "__mocks__/"]
+    || ["__tests__/", "__mocks__/", "test/", "tests/"]
       .iter()
       .any(|d| rel.starts_with(d) || rel.contains(&format!("/{d}")))
 }
@@ -288,7 +343,7 @@ pub fn read_jsonc(path: &Path) -> Option<Value> {
 
 /// Drops `//` and `/* */` comments and commas directly before a closing
 /// bracket, leaving string literals intact.
-fn strip_jsonc(src: &str) -> String {
+pub fn strip_jsonc(src: &str) -> String {
   let chars: Vec<char> = src.chars().collect();
   let mut no_comments = String::with_capacity(src.len());
   let mut i = 0;
@@ -447,30 +502,4 @@ fn normalize(path: &Path) -> PathBuf {
     }
   }
   out
-}
-
-#[cfg(test)]
-mod test {
-  use super::*;
-
-  #[test]
-  fn strips_jsonc() {
-    let src = r#"{
-      // comment
-      "a": "http://x", /* block */
-      "b": [1, 2,],
-    }"#;
-    let v: Value = serde_json::from_str(&strip_jsonc(src)).unwrap();
-    assert_eq!(v["a"], "http://x");
-    assert_eq!(v["b"], serde_json::json!([1, 2]));
-  }
-
-  #[test]
-  fn excludes_tests_and_declarations() {
-    assert!(is_excluded("src/a.d.ts"));
-    assert!(is_excluded("src/a.test.tsx"));
-    assert!(is_excluded("__tests__/App.test.tsx"));
-    assert!(is_excluded("src/__mocks__/x.ts"));
-    assert!(!is_excluded("src/testing/util.ts"));
-  }
 }

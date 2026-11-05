@@ -19,6 +19,16 @@ impl Slot {
   }
 }
 
+/// `--no-rebuild`: set by the CLI before any [`Caches`] is created.
+static SKIP_REBUILD: AtomicBool = AtomicBool::new(false);
+
+/// Makes every [`Caches`] created afterwards use the caches on disk as they
+/// are, ignoring stamps and forcing; a cache is still built when it is
+/// missing or doesn't parse.
+pub fn skip_rebuild() {
+  SKIP_REBUILD.store(true, Ordering::Relaxed);
+}
+
 pub struct Caches {
   dir: PathBuf,
   /// Prepended to every cache file name, e.g. `discover_rs_kotlin_`.
@@ -27,18 +37,24 @@ pub struct Caches {
   fingerprint: String,
   /// FORCE_REBUILD / BUST_CACHE: rebuild each cache (once per run) regardless of stamps.
   force: bool,
+  /// `--no-rebuild`: any existing cache counts as current; see [`skip_rebuild`].
+  skip: bool,
 }
 
 impl Caches {
   pub fn new(dir: PathBuf, prefix: &str, fingerprint: String) -> Self {
-    let force = ["FORCE_REBUILD", "BUST_CACHE"]
-      .iter()
-      .any(|v| std::env::var(v).is_ok_and(|s| s == "true"));
+    let skip = SKIP_REBUILD.load(Ordering::Relaxed);
+    // Skipping wins over the environment's forcing.
+    let force = !skip
+      && ["FORCE_REBUILD", "BUST_CACHE"]
+        .iter()
+        .any(|v| std::env::var(v).is_ok_and(|s| s == "true"));
     Caches {
       dir,
       prefix: prefix.to_string(),
       fingerprint,
       force,
+      skip,
     }
   }
 
@@ -64,8 +80,11 @@ impl Caches {
     self.fingerprint = fingerprint;
   }
 
+  /// Whether a cache file is current: stamped with the current fingerprint,
+  /// or, with `--no-rebuild`, merely present.
   pub fn is_valid(&self, cache: &Path) -> bool {
-    cache.is_file() && fs::read_to_string(stamp_path(cache)).is_ok_and(|s| s.trim() == self.fingerprint)
+    cache.is_file()
+      && (self.skip || fs::read_to_string(stamp_path(cache)).is_ok_and(|s| s.trim() == self.fingerprint))
   }
 
   /// Whether a cache must be rebuilt now: forced (once per run), or stale.

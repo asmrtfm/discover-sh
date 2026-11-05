@@ -1,0 +1,6 @@
+# Local only (gitignored): build against the checked-out ast-grep fork instead
+# of fetching it from git. Paths are relative to rust/. Delete this file to
+# build from the git dependency.
+[patch."https://github.com/asmrtfm/ast-grep"]
+ast-grep-core = { path = "../../forks/ast-grep/crates/core" }
+ast-grep-language = { path = "../../forks/ast-grep/crates/language" }

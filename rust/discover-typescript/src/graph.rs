@@ -59,7 +59,8 @@ impl TsLang {
 }
 
 impl Lang for TsLang {
-  const NAME: &'static str = "discover-typescript";
+  // Names the command in usage messages.
+  const NAME: &'static str = "discover --lang=typescript";
 
   fn root(&self) -> &Path {
     &self.project.root
@@ -90,7 +91,7 @@ impl Lang for TsLang {
 
   fn compute_live(&self, _caches: &Caches) -> Result<Vec<String>, String> {
     if self.project.entries.is_empty() {
-      return Err("no entry point found (set DISCOVER_ENTRY to the repo-relative entry file(s))".into());
+      return Err("no entry point found (list them under entries in discover.conf, see: discover config)".into());
     }
 
     let mut frontier: Vec<PathBuf> = self
