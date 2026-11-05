@@ -2,3 +2,4 @@ tests/fixtures/swift-project/.build/
 dist/
 .toolchains/
 .claude/settings.local.json
+target
